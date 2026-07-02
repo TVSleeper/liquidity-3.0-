@@ -1,0 +1,1098 @@
+import {
+  Activity,
+  ArrowDownUp,
+  CheckCircle2,
+  CircleDot,
+  PlugZap,
+  RefreshCcw,
+  ShieldCheck,
+  Wallet
+} from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  createWalletClient,
+  custom,
+  formatUnits,
+  getAddress,
+  isAddress,
+  parseUnits,
+  type Address,
+  type Hex,
+  type PublicClient,
+  type WalletClient
+} from "viem";
+import { bsc } from "viem/chains";
+import { clPositionManagerAbi, swapEvent } from "./lib/abis";
+import {
+  approvePermit2Spender,
+  approveTokenToPermit2,
+  readApprovalState,
+  type ApprovalState
+} from "./lib/approvals";
+import {
+  BSC_CHAIN_ID,
+  BSC_RPC_URL,
+  DEADLINE_SECONDS,
+  DEFAULT_POOL_ID,
+  DEFAULT_SCAN_FROM_BLOCK,
+  INFINITY_ADDRESSES
+} from "./lib/constants";
+import {
+  buildBurnPayload,
+  buildDecreasePayload,
+  buildMintPayload,
+  deadlineFromNow,
+  formatTokenAmount,
+  poolKeyToTuple
+} from "./lib/encoding";
+import {
+  applySlippageDown,
+  applySlippageUp,
+  ceilUsableTick,
+  floorUsableTick,
+  formatCompact,
+  getAmountsForLiquidity,
+  getLiquidityForAmounts,
+  getSqrtRatioAtTick,
+  offsetPercentToTicks,
+  priceAtTick,
+  sqrtPriceX96ToHumanPrice
+} from "./lib/math";
+import {
+  createBscClient,
+  describePrice,
+  discoverPoolKey,
+  loadPoolState
+} from "./lib/pool";
+import { readPositionById, scanOwnedPositions } from "./lib/positions";
+import type { PoolState, PositionInfo, TokenInfo, TradeEvent } from "./lib/types";
+import { deployWithWallet, writeWithWallet } from "./lib/wallet";
+import {
+  atomicExecutorBytecode,
+  atomicExecutorCompiledAbi
+} from "./generated/AtomicLiquidityExecutor";
+import { atomicExecutorAbi } from "./lib/abis";
+
+type LiquidityMode = "both" | "token0" | "token1";
+type ApprovalMap = Record<string, ApprovalState>;
+
+function useStoredState<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(() => {
+    const stored = localStorage.getItem(key);
+    if (!stored) return initial;
+    try {
+      return JSON.parse(stored) as T;
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue] as const;
+}
+
+function normalizePercent(value: string, fallback: number): number {
+  const parsed = Number(value.replace(",", "."));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseAmount(value: string, decimals: number): bigint {
+  const clean = value.trim().replace(",", ".");
+  if (!clean) return 0n;
+  return parseUnits(clean, decimals);
+}
+
+function tokenKey(token: Address, spender: Address) {
+  return `${token.toLowerCase()}-${spender.toLowerCase()}`;
+}
+
+function statusClass(message: string) {
+  if (message.toLowerCase().includes("ошибка")) return "status error";
+  if (message.toLowerCase().includes("готово")) return "status ok";
+  return "status";
+}
+
+function computeRange(pool: PoolState, mode: LiquidityMode, offsetPercent: number) {
+  const tickSpacing = Math.max(1, pool.tickSpacing);
+  const offsetTicks = offsetPercentToTicks(offsetPercent);
+  const anchor = pool.tick + offsetTicks;
+
+  if (mode === "token0") {
+    let lower = ceilUsableTick(anchor, tickSpacing);
+    if (lower <= pool.tick) lower += tickSpacing;
+    return { tickLower: lower, tickUpper: lower + tickSpacing };
+  }
+
+  if (mode === "token1") {
+    let upper = floorUsableTick(anchor, tickSpacing);
+    if (upper > pool.tick) upper -= tickSpacing;
+    return { tickLower: upper - tickSpacing, tickUpper: upper };
+  }
+
+  const lower = floorUsableTick(anchor, tickSpacing);
+  return { tickLower: lower, tickUpper: lower + tickSpacing };
+}
+
+function computeLiquidityPreview(args: {
+  pool: PoolState;
+  mode: LiquidityMode;
+  offsetPercent: number;
+  amount0: string;
+  amount1: string;
+  slippageBps: number;
+}) {
+  const { tickLower, tickUpper } = computeRange(args.pool, args.mode, args.offsetPercent);
+  const sqrtLower = getSqrtRatioAtTick(tickLower);
+  const sqrtUpper = getSqrtRatioAtTick(tickUpper);
+  const amount0 =
+    args.mode === "token1" ? 0n : parseAmount(args.amount0, args.pool.token0.decimals);
+  const amount1 =
+    args.mode === "token0" ? 0n : parseAmount(args.amount1, args.pool.token1.decimals);
+  const liquidity = getLiquidityForAmounts(
+    args.pool.sqrtPriceX96,
+    sqrtLower,
+    sqrtUpper,
+    amount0,
+    amount1
+  );
+
+  return {
+    tickLower,
+    tickUpper,
+    sqrtLower,
+    sqrtUpper,
+    amount0,
+    amount1,
+    amount0Max: args.amount0 ? applySlippageUp(amount0, args.slippageBps) : 0n,
+    amount1Max: args.amount1 ? applySlippageUp(amount1, args.slippageBps) : 0n,
+    liquidity
+  };
+}
+
+function pctToLiquidity(liquidity: bigint, percentText: string) {
+  const percent = Math.min(100, Math.max(0, normalizePercent(percentText, 100)));
+  return (liquidity * BigInt(Math.round(percent * 100))) / 10_000n;
+}
+
+function readableTrade(trade: TradeEvent, token0: TokenInfo, token1: TokenInfo) {
+  const inputToken = trade.amount0 > 0n ? token0 : trade.amount1 > 0n ? token1 : null;
+  const outputToken = trade.amount0 < 0n ? token0 : trade.amount1 < 0n ? token1 : null;
+  const inputAmount = trade.amount0 > 0n ? trade.amount0 : trade.amount1 > 0n ? trade.amount1 : 0n;
+  const outputAmount =
+    trade.amount0 < 0n ? -trade.amount0 : trade.amount1 < 0n ? -trade.amount1 : 0n;
+
+  return { inputToken, outputToken, inputAmount, outputAmount };
+}
+
+export function App() {
+  const [rpcUrl, setRpcUrl] = useStoredState("rpcUrl", BSC_RPC_URL);
+  const [poolId, setPoolId] = useStoredState("poolId", DEFAULT_POOL_ID);
+  const [scanFromBlock, setScanFromBlock] = useStoredState(
+    "scanFromBlock",
+    DEFAULT_SCAN_FROM_BLOCK.toString()
+  );
+  const [helperAddress, setHelperAddress] = useStoredState("helperAddress", "");
+
+  const [account, setAccount] = useState<Address | null>(null);
+  const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
+  const [pool, setPool] = useState<PoolState | null>(null);
+  const [positions, setPositions] = useState<PositionInfo[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalMap>({});
+  const [status, setStatus] = useState("Готов к подключению MetaMask.");
+  const [busy, setBusy] = useState(false);
+
+  const [mode, setMode] = useState<LiquidityMode>("both");
+  const [offsetPercent, setOffsetPercent] = useState("0");
+  const [amount0, setAmount0] = useState("");
+  const [amount1, setAmount1] = useState("");
+  const [slippageBps, setSlippageBps] = useState("50");
+  const [positionPercents, setPositionPercents] = useState<Record<string, string>>({});
+  const [selectedPositionId, setSelectedPositionId] = useState<string>("");
+  const [manualTokenId, setManualTokenId] = useState("");
+  const [exitPercent, setExitPercent] = useState("100");
+  const [sellCurrency, setSellCurrency] = useState<Address | "">("");
+  const [minOut, setMinOut] = useState("");
+
+  const [watching, setWatching] = useState(false);
+  const [lastSeenBlock, setLastSeenBlock] = useState<bigint | null>(null);
+  const [lastTrade, setLastTrade] = useState<TradeEvent | null>(null);
+  const [rebalanceMinOut, setRebalanceMinOut] = useState("");
+  const [rebalanceSafety, setRebalanceSafety] = useState("90");
+
+  const client = useMemo(() => createBscClient(rpcUrl), [rpcUrl]);
+
+  const currentPosition =
+    positions.find((item) => item.tokenId.toString() === selectedPositionId) ??
+    positions[0] ??
+    null;
+
+  const inferredSellCurrency = useMemo(() => {
+    if (!pool) return "";
+    if (pool.token0.symbol.toUpperCase().includes("NES")) return pool.token0.address;
+    if (pool.token1.symbol.toUpperCase().includes("NES")) return pool.token1.address;
+    return pool.token0.address;
+  }, [pool]);
+
+  useEffect(() => {
+    if (!sellCurrency && inferredSellCurrency) setSellCurrency(inferredSellCurrency);
+  }, [inferredSellCurrency, sellCurrency]);
+
+  useEffect(() => {
+    if (!selectedPositionId && positions[0]) {
+      setSelectedPositionId(positions[0].tokenId.toString());
+    }
+  }, [positions, selectedPositionId]);
+
+  const preview = useMemo(() => {
+    if (!pool) return null;
+    try {
+      return computeLiquidityPreview({
+        pool,
+        mode,
+        offsetPercent: normalizePercent(offsetPercent, 0),
+        amount0,
+        amount1,
+        slippageBps: Math.max(0, Math.floor(normalizePercent(slippageBps, 50)))
+      });
+    } catch {
+      return null;
+    }
+  }, [amount0, amount1, mode, offsetPercent, pool, slippageBps]);
+
+  async function ensureBsc() {
+    if (!window.ethereum) throw new Error("MetaMask не найден.");
+    const chainId = await window.ethereum.request({ method: "eth_chainId" });
+    if (chainId === "0x38") return;
+    try {
+      await window.ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: "0x38" }]
+      });
+    } catch (error) {
+      const code = (error as { code?: number }).code;
+      if (code !== 4902) throw error;
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: "0x38",
+            chainName: "BNB Smart Chain",
+            nativeCurrency: { name: "BNB", symbol: "BNB", decimals: 18 },
+            rpcUrls: [BSC_RPC_URL],
+            blockExplorerUrls: ["https://bscscan.com"]
+          }
+        ]
+      });
+    }
+  }
+
+  async function connectWallet() {
+    if (!window.ethereum) {
+      setStatus("Ошибка: MetaMask не найден в браузере.");
+      return;
+    }
+    try {
+      setBusy(true);
+      await ensureBsc();
+      const wc = createWalletClient({
+        chain: bsc,
+        transport: custom(window.ethereum)
+      });
+      const [connected] = await wc.requestAddresses();
+      const chainId = await wc.getChainId();
+      if (chainId !== BSC_CHAIN_ID) throw new Error("MetaMask должен быть в BNB Smart Chain.");
+      setAccount(getAddress(connected));
+      setWalletClient(wc);
+      setStatus("Кошелёк подключён. Теперь загрузите пул.");
+    } catch (error) {
+      setStatus(`Ошибка подключения: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadPool() {
+    try {
+      setBusy(true);
+      setStatus("Ищу PoolKey и читаю состояние пула...");
+      const fromBlock = BigInt(scanFromBlock || DEFAULT_SCAN_FROM_BLOCK.toString());
+      const key = await discoverPoolKey(client, poolId as Hex, fromBlock);
+      const state = await loadPoolState(client, poolId as Hex, key, account ?? undefined);
+      setPool(state);
+      setStatus("Пул загружен, диапазоны и балансы готовы.");
+      if (account) await refreshPositionsAndApprovals(client, state, account);
+    } catch (error) {
+      setStatus(`Ошибка загрузки пула: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshPositionsAndApprovals(
+    nextClient: PublicClient = client,
+    nextPool: PoolState | null = pool,
+    owner: Address | null = account
+  ) {
+    if (!nextPool || !owner) return;
+    try {
+      setBusy(true);
+      const knownTokenIds = positions.map((position) => position.tokenId);
+      const [nextPoolState, knownPositions, approval0, approval1] = await Promise.all([
+        loadPoolState(nextClient, nextPool.poolId, nextPool.poolKey, owner),
+        Promise.all(
+          knownTokenIds.map((tokenId) =>
+            readPositionById({
+              client: nextClient,
+              tokenId,
+              owner,
+              poolId: nextPool.poolId
+            })
+          )
+        ),
+        readApprovalState({
+          client: nextClient,
+          owner,
+          token: nextPool.token0.address,
+          spender: INFINITY_ADDRESSES.clPositionManager
+        }),
+        readApprovalState({
+          client: nextClient,
+          owner,
+          token: nextPool.token1.address,
+          spender: INFINITY_ADDRESSES.clPositionManager
+        })
+      ]);
+      setPool(nextPoolState);
+      setPositions(
+        knownPositions.filter((position): position is PositionInfo => Boolean(position))
+      );
+      setApprovals({
+        [tokenKey(nextPool.token0.address, INFINITY_ADDRESSES.clPositionManager)]: approval0,
+        [tokenKey(nextPool.token1.address, INFINITY_ADDRESSES.clPositionManager)]: approval1
+      });
+      setStatus("Готово: балансы, approve и позиции обновлены.");
+    } catch (error) {
+      setStatus(`Ошибка обновления: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addManualPosition() {
+    if (!pool || !account) return;
+    try {
+      setBusy(true);
+      const tokenId = BigInt(manualTokenId.trim());
+      const position = await readPositionById({
+        client,
+        tokenId,
+        owner: account,
+        poolId: pool.poolId
+      });
+      if (!position) {
+        throw new Error("Позиция не найдена, не принадлежит кошельку или относится к другому poolId.");
+      }
+      setPositions((prev) => {
+        const rest = prev.filter((item) => item.tokenId !== tokenId);
+        return [...rest, position].sort((a, b) => Number(a.tokenId - b.tokenId));
+      });
+      setSelectedPositionId(tokenId.toString());
+      setStatus("Готово: позиция добавлена.");
+    } catch (error) {
+      setStatus(`Ошибка tokenId: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function scanPositionsFromLogs() {
+    if (!pool || !account) return;
+    try {
+      setBusy(true);
+      setStatus("Сканирую NFT-позиции по Transfer-логам. На публичных RPC это может быть медленно.");
+      const fromBlock = BigInt(scanFromBlock || DEFAULT_SCAN_FROM_BLOCK.toString());
+      const ownedPositions = await scanOwnedPositions({
+        client,
+        owner: account,
+        poolId: pool.poolId,
+        fromBlock
+      });
+      setPositions(ownedPositions);
+      setStatus("Готово: сканирование позиций завершено.");
+    } catch (error) {
+      setStatus(`Ошибка сканирования: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveForAdd(token: Address) {
+    if (!walletClient || !account || !pool) return;
+    try {
+      setBusy(true);
+      setStatus("Подтвердите ERC20 approve для Permit2...");
+      const hash1 = await approveTokenToPermit2({ walletClient, account, token });
+      await client.waitForTransactionReceipt({ hash: hash1 });
+      setStatus("Теперь подтвердите Permit2 approve для CL Position Manager...");
+      const hash2 = await approvePermit2Spender({
+        walletClient,
+        account,
+        token,
+        spender: INFINITY_ADDRESSES.clPositionManager
+      });
+      await client.waitForTransactionReceipt({ hash: hash2 });
+      await refreshPositionsAndApprovals();
+    } catch (error) {
+      setStatus(`Ошибка approve: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function mintPosition() {
+    if (!walletClient || !account || !pool || !preview) return;
+    try {
+      if (preview.liquidity <= 0n) {
+        throw new Error("Ликвидность равна нулю. Проверьте суммы и положение диапазона.");
+      }
+      setBusy(true);
+      const payload = buildMintPayload({
+        poolKey: pool.poolKey,
+        tickLower: preview.tickLower,
+        tickUpper: preview.tickUpper,
+        liquidity: preview.liquidity,
+        amount0Max: preview.amount0Max,
+        amount1Max: preview.amount1Max,
+        owner: account
+      });
+      setStatus("Подтвердите mint позиции в MetaMask...");
+      const hash = await writeWithWallet(walletClient, {
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "modifyLiquidities",
+        args: [payload, deadlineFromNow(DEADLINE_SECONDS)],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      await refreshPositionsAndApprovals();
+    } catch (error) {
+      setStatus(`Ошибка mint: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePosition(position: PositionInfo, burn: boolean) {
+    if (!walletClient || !account || !pool) return;
+    try {
+      setBusy(true);
+      const percent = burn ? "100" : positionPercents[position.tokenId.toString()] ?? "100";
+      const liquidity = burn ? position.liquidity : pctToLiquidity(position.liquidity, percent);
+      if (liquidity <= 0n) throw new Error("Выбрано 0 ликвидности.");
+      const amounts = getAmountsForLiquidity(
+        pool.sqrtPriceX96,
+        getSqrtRatioAtTick(position.tickLower),
+        getSqrtRatioAtTick(position.tickUpper),
+        liquidity
+      );
+      const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
+      const payload = burn
+        ? buildBurnPayload({
+            poolKey: pool.poolKey,
+            tokenId: position.tokenId,
+            amount0Min: applySlippageDown(amounts.amount0, bps),
+            amount1Min: applySlippageDown(amounts.amount1, bps),
+            recipient: account
+          })
+        : buildDecreasePayload({
+            poolKey: pool.poolKey,
+            tokenId: position.tokenId,
+            liquidity,
+            amount0Min: applySlippageDown(amounts.amount0, bps),
+            amount1Min: applySlippageDown(amounts.amount1, bps),
+            recipient: account
+          });
+      setStatus(burn ? "Подтвердите полное закрытие позиции..." : "Подтвердите снятие ликвидности...");
+      const hash = await writeWithWallet(walletClient, {
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "modifyLiquidities",
+        args: [payload, deadlineFromNow(DEADLINE_SECONDS)],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      await refreshPositionsAndApprovals();
+    } catch (error) {
+      setStatus(`Ошибка снятия: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deployHelper() {
+    if (!walletClient || !account) return;
+    try {
+      if (atomicExecutorBytecode === "0x") {
+        throw new Error("Контракт ещё не скомпилирован. Запустите npm run compile:executor.");
+      }
+      setBusy(true);
+      setStatus("Подтвердите развертывание AtomicLiquidityExecutor...");
+      const hash = await deployWithWallet(walletClient, {
+        abi: atomicExecutorCompiledAbi,
+        bytecode: atomicExecutorBytecode,
+        args: [
+          INFINITY_ADDRESSES.clPositionManager,
+          INFINITY_ADDRESSES.universalRouter,
+          INFINITY_ADDRESSES.permit2
+        ],
+        account
+      });
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      if (!receipt.contractAddress) throw new Error("Контракт не вернул адрес.");
+      setHelperAddress(receipt.contractAddress);
+      setStatus("Готово: helper-контракт развернут и сохранен.");
+    } catch (error) {
+      setStatus(`Ошибка helper deploy: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveNftToHelper(position: PositionInfo) {
+    if (!walletClient || !account || !helperAddress || !isAddress(helperAddress)) return;
+    try {
+      setBusy(true);
+      setStatus("Подтвердите approve NFT-позиции для helper...");
+      const hash = await writeWithWallet(walletClient, {
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "approve",
+        args: [getAddress(helperAddress), position.tokenId],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      setStatus("Готово: helper может управлять этой NFT-позицией по вашему вызову.");
+    } catch (error) {
+      setStatus(`Ошибка NFT approve: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function atomicExitAndSell(position: PositionInfo) {
+    if (!walletClient || !account || !pool || !helperAddress || !isAddress(helperAddress)) return;
+    try {
+      const sell = sellCurrency ? getAddress(sellCurrency) : inferredSellCurrency;
+      const buy =
+        sell.toLowerCase() === pool.token0.address.toLowerCase()
+          ? pool.token1.address
+          : pool.token0.address;
+      const buyToken =
+        buy.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0 : pool.token1;
+      const liquidity = pctToLiquidity(position.liquidity, exitPercent);
+      const amounts = getAmountsForLiquidity(
+        pool.sqrtPriceX96,
+        getSqrtRatioAtTick(position.tickLower),
+        getSqrtRatioAtTick(position.tickUpper),
+        liquidity
+      );
+      const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
+      const amountOutMin = parseAmount(minOut, buyToken.decimals);
+      setBusy(true);
+      setStatus("Подтвердите атомарное снятие и продажу в MetaMask...");
+      const hash = await writeWithWallet(walletClient, {
+        address: getAddress(helperAddress),
+        abi: atomicExecutorAbi,
+        functionName: "exitAndSwapToCurrency",
+        args: [
+          poolKeyToTuple(pool.poolKey),
+          position.tokenId,
+          liquidity,
+          applySlippageDown(amounts.amount0, bps),
+          applySlippageDown(amounts.amount1, bps),
+          sell,
+          buy,
+          amountOutMin,
+          deadlineFromNow(DEADLINE_SECONDS)
+        ],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      await refreshPositionsAndApprovals();
+    } catch (error) {
+      setStatus(`Ошибка atomic exit: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!watching || !pool) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const latest = await client.getBlockNumber();
+        const fromBlock = lastSeenBlock ? lastSeenBlock + 1n : latest;
+        if (fromBlock > latest) return;
+        const logs = [];
+        for (let start = fromBlock; start <= latest; start += 11n) {
+          const end = start + 10n > latest ? latest : start + 10n;
+          const chunk = await client.getLogs({
+            address: INFINITY_ADDRESSES.clPoolManager,
+            event: swapEvent,
+            args: { id: pool.poolId },
+            fromBlock: start,
+            toBlock: end
+          });
+          logs.push(...chunk);
+        }
+        if (cancelled) return;
+        setLastSeenBlock(latest);
+        const last = logs[logs.length - 1];
+        if (last?.args.sender && last.args.amount0 !== undefined && last.args.amount1 !== undefined) {
+          setLastTrade({
+            blockNumber: last.blockNumber,
+            transactionHash: last.transactionHash,
+            sender: last.args.sender,
+            amount0: last.args.amount0,
+            amount1: last.args.amount1,
+            sqrtPriceX96: last.args.sqrtPriceX96 ?? pool.sqrtPriceX96,
+            tick: last.args.tick ?? pool.tick
+          });
+        }
+      } catch (error) {
+        setStatus(`Ошибка monitor: ${(error as Error).message}`);
+      }
+    };
+    const timer = window.setInterval(poll, 4_000);
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [client, lastSeenBlock, pool, watching]);
+
+  async function executeRebalanceDraft(position: PositionInfo) {
+    if (!walletClient || !account || !pool || !helperAddress || !isAddress(helperAddress) || !lastTrade) return;
+    const readable = readableTrade(lastTrade, pool.token0, pool.token1);
+    if (!readable.inputToken || !readable.outputToken) {
+      setStatus("Ошибка ребаланса: не удалось определить сторону swap-события.");
+      return;
+    }
+
+    try {
+      const liquidityToRemove = position.liquidity;
+      const removed = getAmountsForLiquidity(
+        pool.sqrtPriceX96,
+        getSqrtRatioAtTick(position.tickLower),
+        getSqrtRatioAtTick(position.tickUpper),
+        liquidityToRemove
+      );
+      const { tickLower, tickUpper } = computeRange(pool, "both", 0);
+      const price = sqrtPriceX96ToHumanPrice(
+        pool.sqrtPriceX96,
+        pool.token0.decimals,
+        pool.token1.decimals
+      );
+      const inputIs0 =
+        readable.inputToken.address.toLowerCase() === pool.token0.address.toLowerCase();
+      const swapAmountIn = readable.inputAmount;
+      const inputHuman = Number(formatUnits(swapAmountIn, readable.inputToken.decimals));
+      const estimatedOutHuman = inputIs0 ? inputHuman * price : inputHuman / price;
+      const estimatedOut = parseUnits(
+        Math.max(0, estimatedOutHuman * 0.995).toFixed(readable.outputToken.decimals),
+        readable.outputToken.decimals
+      );
+
+      let amount0After = removed.amount0;
+      let amount1After = removed.amount1;
+      if (inputIs0) {
+        amount0After = amount0After > swapAmountIn ? amount0After - swapAmountIn : 0n;
+        amount1After += estimatedOut;
+      } else {
+        amount1After = amount1After > swapAmountIn ? amount1After - swapAmountIn : 0n;
+        amount0After += estimatedOut;
+      }
+
+      const safety = Math.min(100, Math.max(1, normalizePercent(rebalanceSafety, 90)));
+      const mintLiquidity =
+        (getLiquidityForAmounts(
+          pool.sqrtPriceX96,
+          getSqrtRatioAtTick(tickLower),
+          getSqrtRatioAtTick(tickUpper),
+          amount0After,
+          amount1After
+        ) *
+          BigInt(Math.round(safety * 100))) /
+        10_000n;
+
+      const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
+      const minOutput = parseAmount(rebalanceMinOut, readable.outputToken.decimals);
+      setBusy(true);
+      setStatus("Подтвердите черновой rebalance-транзакт в MetaMask...");
+      const hash = await writeWithWallet(walletClient, {
+        address: getAddress(helperAddress),
+        abi: atomicExecutorAbi,
+        functionName: "rebalance",
+        args: [
+          poolKeyToTuple(pool.poolKey),
+          position.tokenId,
+          liquidityToRemove,
+          applySlippageDown(removed.amount0, bps),
+          applySlippageDown(removed.amount1, bps),
+          readable.inputToken.address,
+          readable.outputToken.address,
+          swapAmountIn,
+          minOutput,
+          tickLower,
+          tickUpper,
+          mintLiquidity,
+          amount0After,
+          amount1After,
+          deadlineFromNow(DEADLINE_SECONDS)
+        ],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      await refreshPositionsAndApprovals();
+    } catch (error) {
+      setStatus(`Ошибка rebalance: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const priceLabel = pool ? describePrice(pool) : "Пул ещё не загружен";
+  const minRangePercent = pool ? (Math.pow(1.0001, Math.max(1, pool.tickSpacing)) - 1) * 100 : 0.01;
+  const lastTradeReadable = pool && lastTrade ? readableTrade(lastTrade, pool.token0, pool.token1) : null;
+
+  return (
+    <main className="app-shell">
+      <section className="topbar">
+        <div>
+          <h1>NES/USDT Liquidity Console</h1>
+          <p>{priceLabel}</p>
+        </div>
+        <button className="primary" onClick={connectWallet} disabled={busy}>
+          <Wallet size={18} />
+          {account ? `${account.slice(0, 6)}…${account.slice(-4)}` : "MetaMask"}
+        </button>
+      </section>
+
+      <section className={statusClass(status)}>
+        <CircleDot size={16} />
+        <span>{status}</span>
+      </section>
+
+      <section className="grid two">
+        <div className="panel">
+          <div className="panel-title">
+            <PlugZap size={18} />
+            <h2>Пул</h2>
+          </div>
+          <label>
+            Pool ID
+            <input value={poolId} onChange={(event) => setPoolId(event.target.value as Hex)} />
+          </label>
+          <div className="row">
+            <label>
+              RPC
+              <input value={rpcUrl} onChange={(event) => setRpcUrl(event.target.value)} />
+            </label>
+            <label>
+              Scan from block
+              <input value={scanFromBlock} onChange={(event) => setScanFromBlock(event.target.value)} />
+            </label>
+          </div>
+          <button className="primary wide" onClick={loadPool} disabled={busy}>
+            <RefreshCcw size={18} />
+            Загрузить пул
+          </button>
+          {pool && (
+            <div className="facts">
+              <span>Tick: {pool.tick}</span>
+              <span>Tick spacing: {pool.tickSpacing}</span>
+              <span>Min range: {formatCompact(minRangePercent, 5)}%</span>
+              <span>LP fee: {pool.lpFee}</span>
+              <span>
+                {pool.token0.symbol}: {formatTokenAmount(pool.token0.balance, pool.token0.decimals)}
+              </span>
+              <span>
+                {pool.token1.symbol}: {formatTokenAmount(pool.token1.balance, pool.token1.decimals)}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">
+            <ShieldCheck size={18} />
+            <h2>Approve для добавления</h2>
+          </div>
+          {!pool && <p className="muted">Загрузите пул, чтобы увидеть токены.</p>}
+          {pool &&
+            [pool.token0, pool.token1].map((token) => {
+              const approval = approvals[tokenKey(token.address, INFINITY_ADDRESSES.clPositionManager)];
+              const ok = approval && approval.erc20Allowance > 0n && approval.permit2Allowance > 0n;
+              return (
+                <div className="approval" key={token.address}>
+                  <div>
+                    <strong>{token.symbol}</strong>
+                    <span>{ok ? "Permit2 готов" : "Нужен approve"}</span>
+                  </div>
+                  <button onClick={() => approveForAdd(token.address)} disabled={!account || busy}>
+                    <CheckCircle2 size={16} />
+                    Approve
+                  </button>
+                </div>
+              );
+            })}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <ArrowDownUp size={18} />
+          <h2>Добавить концентрированную ликвидность</h2>
+        </div>
+        <div className="segmented">
+          <button className={mode === "both" ? "active" : ""} onClick={() => setMode("both")}>
+            2 токена
+          </button>
+          <button className={mode === "token0" ? "active" : ""} onClick={() => setMode("token0")}>
+            Только {pool?.token0.symbol ?? "token0"}
+          </button>
+          <button className={mode === "token1" ? "active" : ""} onClick={() => setMode("token1")}>
+            Только {pool?.token1.symbol ?? "token1"}
+          </button>
+        </div>
+        <div className="grid four">
+          <label>
+            Offset от текущей цены, %
+            <input value={offsetPercent} onChange={(event) => setOffsetPercent(event.target.value)} />
+          </label>
+          <label>
+            {pool?.token0.symbol ?? "Token0"}
+            <input
+              value={amount0}
+              disabled={mode === "token1"}
+              onChange={(event) => setAmount0(event.target.value)}
+              placeholder="0.0"
+            />
+          </label>
+          <label>
+            {pool?.token1.symbol ?? "Token1"}
+            <input
+              value={amount1}
+              disabled={mode === "token0"}
+              onChange={(event) => setAmount1(event.target.value)}
+              placeholder="0.0"
+            />
+          </label>
+          <label>
+            Slippage, bps
+            <input value={slippageBps} onChange={(event) => setSlippageBps(event.target.value)} />
+          </label>
+        </div>
+        {pool && preview && (
+          <div className="preview">
+            <span>
+              Range: {preview.tickLower} → {preview.tickUpper}
+            </span>
+            <span>
+              Prices: {formatCompact(priceAtTick(preview.tickLower, pool.token0.decimals, pool.token1.decimals))} →{" "}
+              {formatCompact(priceAtTick(preview.tickUpper, pool.token0.decimals, pool.token1.decimals))}
+            </span>
+            <span>Liquidity: {preview.liquidity.toString()}</span>
+          </div>
+        )}
+        <button className="primary wide" onClick={mintPosition} disabled={!pool || !account || !preview || busy}>
+          Добавить ликвидность
+        </button>
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <Activity size={18} />
+          <h2>Позиции</h2>
+          <button onClick={() => refreshPositionsAndApprovals()} disabled={!pool || !account || busy}>
+            Обновить
+          </button>
+        </div>
+        <div className="row">
+          <label>
+            NFT tokenId
+            <input
+              value={manualTokenId}
+              onChange={(event) => setManualTokenId(event.target.value)}
+              placeholder="Например 12345"
+            />
+          </label>
+          <button onClick={addManualPosition} disabled={!pool || !account || !manualTokenId || busy}>
+            Добавить tokenId
+          </button>
+        </div>
+        <button onClick={scanPositionsFromLogs} disabled={!pool || !account || busy}>
+          Сканировать Transfer-логи
+        </button>
+        {positions.length === 0 && <p className="muted">Позиции этого кошелька по текущему poolId не найдены.</p>}
+        <div className="positions">
+          {positions.map((position) => {
+            const amounts = pool
+              ? getAmountsForLiquidity(
+                  pool.sqrtPriceX96,
+                  getSqrtRatioAtTick(position.tickLower),
+                  getSqrtRatioAtTick(position.tickUpper),
+                  position.liquidity
+                )
+              : { amount0: 0n, amount1: 0n };
+            return (
+              <article className="position" key={position.tokenId.toString()}>
+                <div>
+                  <strong>#{position.tokenId.toString()}</strong>
+                  <span>
+                    {position.tickLower} → {position.tickUpper}
+                  </span>
+                  {pool && (
+                    <span>
+                      ~{formatTokenAmount(amounts.amount0, pool.token0.decimals, 4)} {pool.token0.symbol} /{" "}
+                      {formatTokenAmount(amounts.amount1, pool.token1.decimals, 4)} {pool.token1.symbol}
+                    </span>
+                  )}
+                </div>
+                <label className="small">
+                  %
+                  <input
+                    value={positionPercents[position.tokenId.toString()] ?? "100"}
+                    onChange={(event) =>
+                      setPositionPercents((prev) => ({
+                        ...prev,
+                        [position.tokenId.toString()]: event.target.value
+                      }))
+                    }
+                  />
+                </label>
+                <button onClick={() => removePosition(position, false)} disabled={busy}>
+                  Снять %
+                </button>
+                <button onClick={() => removePosition(position, true)} disabled={busy}>
+                  Снять всё
+                </button>
+              </article>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="grid two">
+        <div className="panel">
+          <div className="panel-title">
+            <ShieldCheck size={18} />
+            <h2>Atomic exit + sell</h2>
+          </div>
+          <p className="notice">
+            Работает одной транзакцией: снять ликвидность, продать выбранный токен через этот же пул и вернуть остатки.
+          </p>
+          <div className="row">
+            <label>
+              Helper contract
+              <input value={helperAddress} onChange={(event) => setHelperAddress(event.target.value)} />
+            </label>
+            <button onClick={deployHelper} disabled={!account || busy}>
+              Deploy
+            </button>
+          </div>
+          <div className="row">
+            <label>
+              Position
+              <select value={selectedPositionId} onChange={(event) => setSelectedPositionId(event.target.value)}>
+                {positions.map((position) => (
+                  <option key={position.tokenId.toString()} value={position.tokenId.toString()}>
+                    #{position.tokenId.toString()}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Exit %
+              <input value={exitPercent} onChange={(event) => setExitPercent(event.target.value)} />
+            </label>
+          </div>
+          {pool && (
+            <div className="row">
+              <label>
+                Sell token
+                <select value={sellCurrency} onChange={(event) => setSellCurrency(event.target.value as Address)}>
+                  <option value={pool.token0.address}>{pool.token0.symbol}</option>
+                  <option value={pool.token1.address}>{pool.token1.symbol}</option>
+                </select>
+              </label>
+              <label>
+                Min out
+                <input value={minOut} onChange={(event) => setMinOut(event.target.value)} placeholder="0.0" />
+              </label>
+            </div>
+          )}
+          <div className="row">
+            <button onClick={() => currentPosition && approveNftToHelper(currentPosition)} disabled={!currentPosition || busy}>
+              Approve NFT
+            </button>
+            <button
+              className="primary"
+              onClick={() => currentPosition && atomicExitAndSell(currentPosition)}
+              disabled={!currentPosition || !pool || !helperAddress || busy}
+            >
+              Снять и продать
+            </button>
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">
+            <RefreshCcw size={18} />
+            <h2>Авто-ребалансировка</h2>
+          </div>
+          <p className="notice">
+            Локальный MetaMask не может сам подписывать сделки и не гарантирует тот же блок после чужого swap. Этот монитор ловит swap-события и готовит атомарный rebalance-транзакт.
+          </p>
+          <div className="row">
+            <button className={watching ? "danger" : "primary"} onClick={() => setWatching((value) => !value)} disabled={!pool}>
+              {watching ? "Остановить monitor" : "Включить monitor"}
+            </button>
+            <label>
+              Mint safety, %
+              <input value={rebalanceSafety} onChange={(event) => setRebalanceSafety(event.target.value)} />
+            </label>
+          </div>
+          {lastTradeReadable?.inputToken && lastTradeReadable.outputToken && (
+            <div className="preview">
+              <span>Block: {lastTrade?.blockNumber.toString()}</span>
+              <span>
+                Input: {formatTokenAmount(lastTradeReadable.inputAmount, lastTradeReadable.inputToken.decimals, 6)}{" "}
+                {lastTradeReadable.inputToken.symbol}
+              </span>
+              <span>
+                Output: {formatTokenAmount(lastTradeReadable.outputAmount, lastTradeReadable.outputToken.decimals, 6)}{" "}
+                {lastTradeReadable.outputToken.symbol}
+              </span>
+            </div>
+          )}
+          <label>
+            Rebalance min out
+            <input value={rebalanceMinOut} onChange={(event) => setRebalanceMinOut(event.target.value)} placeholder="0.0" />
+          </label>
+          <button
+            className="primary wide"
+            onClick={() => currentPosition && executeRebalanceDraft(currentPosition)}
+            disabled={!currentPosition || !lastTrade || !helperAddress || busy}
+          >
+            Подготовить rebalance по последнему swap
+          </button>
+        </div>
+      </section>
+    </main>
+  );
+}
