@@ -9,6 +9,16 @@ import { DEFAULT_SCAN_FROM_BLOCK, INFINITY_ADDRESSES, ZERO_ADDRESS } from "./con
 import { computePoolId, tupleToPoolKey } from "./encoding";
 import type { PositionInfo } from "./types";
 
+type PositionScanProgress = {
+  fromBlock: bigint;
+  toBlock: bigint;
+  latestBlock: bigint;
+  foundTokenIds: number;
+};
+
+const MAX_TRANSFER_LOG_BLOCKS = 5_000n;
+const MIN_TRANSFER_LOG_BLOCKS = 50n;
+
 export async function readPositionById(args: {
   client: PublicClient;
   tokenId: bigint;
@@ -58,35 +68,69 @@ async function collectTransferTokenIds(
   client: PublicClient,
   owner: Address,
   fromBlock: bigint,
-  toBlock: bigint
+  toBlock: bigint,
+  onProgress?: (progress: PositionScanProgress) => void
 ): Promise<Set<bigint>> {
   const owned = new Set<bigint>();
-  const chunkSize = 10n;
+  const ownerLower = getAddress(owner).toLowerCase();
+  let chunkSize = MAX_TRANSFER_LOG_BLOCKS;
+  let start = fromBlock;
 
-  for (let start = fromBlock; start <= toBlock; start += chunkSize + 1n) {
-    const end = start + chunkSize > toBlock ? toBlock : start + chunkSize;
-    const [incoming, outgoing] = await Promise.all([
-      client.getLogs({
-        address: INFINITY_ADDRESSES.clPositionManager,
-        event: transferEvent,
-        args: { to: owner },
-        fromBlock: start,
-        toBlock: end
-      }),
-      client.getLogs({
-        address: INFINITY_ADDRESSES.clPositionManager,
-        event: transferEvent,
-        args: { from: owner },
-        fromBlock: start,
-        toBlock: end
-      })
-    ]);
+  while (start <= toBlock) {
+    const end = start + chunkSize - 1n > toBlock ? toBlock : start + chunkSize - 1n;
 
-    for (const log of incoming) {
-      if (log.args.id !== undefined) owned.add(log.args.id);
-    }
-    for (const log of outgoing) {
-      if (log.args.id !== undefined) owned.delete(log.args.id);
+    try {
+      const [incoming, outgoing] = await Promise.all([
+        client.getLogs({
+          address: INFINITY_ADDRESSES.clPositionManager,
+          event: transferEvent,
+          args: { to: owner },
+          fromBlock: start,
+          toBlock: end
+        }),
+        client.getLogs({
+          address: INFINITY_ADDRESSES.clPositionManager,
+          event: transferEvent,
+          args: { from: owner },
+          fromBlock: start,
+          toBlock: end
+        })
+      ]);
+
+      const uniqueLogs = new Map<string, (typeof incoming)[number]>();
+      for (const log of [...incoming, ...outgoing]) {
+        uniqueLogs.set(`${log.transactionHash}-${log.logIndex}`, log);
+      }
+
+      const orderedLogs = [...uniqueLogs.values()].sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1;
+        return a.logIndex - b.logIndex;
+      });
+
+      for (const log of orderedLogs) {
+        const tokenId = log.args.id;
+        if (tokenId === undefined || !log.args.from || !log.args.to) continue;
+
+        const fromLower = getAddress(log.args.from).toLowerCase();
+        const toLower = getAddress(log.args.to).toLowerCase();
+        if (fromLower === ownerLower && toLower !== ownerLower) owned.delete(tokenId);
+        if (toLower === ownerLower) owned.add(tokenId);
+      }
+
+      onProgress?.({
+        fromBlock: start,
+        toBlock: end,
+        latestBlock: toBlock,
+        foundTokenIds: owned.size
+      });
+
+      start = end + 1n;
+      if (chunkSize < MAX_TRANSFER_LOG_BLOCKS) {
+        chunkSize = chunkSize * 2n > MAX_TRANSFER_LOG_BLOCKS ? MAX_TRANSFER_LOG_BLOCKS : chunkSize * 2n;
+      }
+    } catch (error) {
+      if (chunkSize <= MIN_TRANSFER_LOG_BLOCKS) throw error;
+      chunkSize = chunkSize / 2n < MIN_TRANSFER_LOG_BLOCKS ? MIN_TRANSFER_LOG_BLOCKS : chunkSize / 2n;
     }
   }
 
@@ -98,14 +142,22 @@ export async function scanOwnedPositions(args: {
   owner: Address;
   poolId: Hex;
   fromBlock?: bigint;
+  toBlock?: bigint;
+  onProgress?: (progress: PositionScanProgress) => void;
 }): Promise<PositionInfo[]> {
   const fromBlock = args.fromBlock ?? DEFAULT_SCAN_FROM_BLOCK;
-  const latest = await args.client.getBlockNumber();
+  const latest = args.toBlock ?? await args.client.getBlockNumber();
+  if (fromBlock > latest) {
+    throw new Error(
+      `Scan from block (${fromBlock.toString()}) больше текущего блока BNB Chain (${latest.toString()}). Установите меньший блок, например ${DEFAULT_SCAN_FROM_BLOCK.toString()}.`
+    );
+  }
   const tokenIds = await collectTransferTokenIds(
     args.client,
     args.owner,
     fromBlock,
-    latest
+    latest,
+    args.onProgress
   );
 
   const positions: PositionInfo[] = [];

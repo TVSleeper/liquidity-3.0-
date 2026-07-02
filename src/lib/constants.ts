@@ -5,7 +5,7 @@ export const DEFAULT_POOL_ID =
 
 export const BSC_CHAIN_ID = 56;
 export const BSC_RPC_URL = "https://bsc-mainnet.public.blastapi.io";
-export const DEFAULT_SCAN_FROM_BLOCK = 106_000_000n;
+export const DEFAULT_SCAN_FROM_BLOCK = 48_000_000n;
 
 export const ZERO_ADDRESS =
   "0x0000000000000000000000000000000000000000" as Address;

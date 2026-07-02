@@ -113,6 +113,12 @@ function parseAmount(value: string, decimals: number): bigint {
   return parseUnits(clean, decimals);
 }
 
+function parseBlockNumber(value: string, fallback: bigint): bigint {
+  const clean = value.trim().replaceAll("_", "");
+  if (!/^\d+$/.test(clean)) return fallback;
+  return BigInt(clean);
+}
+
 function tokenKey(token: Address, spender: Address) {
   return `${token.toLowerCase()}-${spender.toLowerCase()}`;
 }
@@ -371,7 +377,7 @@ export function App() {
     try {
       setBusy(true);
       setStatus("Ищу PoolKey и читаю состояние пула...");
-      const fromBlock = BigInt(scanFromBlock || DEFAULT_SCAN_FROM_BLOCK.toString());
+      const fromBlock = parseBlockNumber(scanFromBlock, DEFAULT_SCAN_FROM_BLOCK);
       const key = await discoverPoolKey(client, poolId as Hex, fromBlock);
       const state = await loadPoolState(client, poolId as Hex, key, account ?? undefined);
       setPool(state);
@@ -497,16 +503,44 @@ export function App() {
     if (!pool || !account) return;
     try {
       setBusy(true);
-      setStatus("Сканирую NFT-позиции по Transfer-логам. На публичных RPC это может быть медленно.");
-      const fromBlock = BigInt(scanFromBlock || DEFAULT_SCAN_FROM_BLOCK.toString());
+      setStatus("Готовлю поиск NFT-позиций по Transfer-логам...");
+      const latestBlock = await client.getBlockNumber();
+      let fromBlock = parseBlockNumber(scanFromBlock, DEFAULT_SCAN_FROM_BLOCK);
+      if (fromBlock > latestBlock) {
+        const fallbackBlock = DEFAULT_SCAN_FROM_BLOCK < latestBlock ? DEFAULT_SCAN_FROM_BLOCK : 0n;
+        fromBlock = fallbackBlock;
+        setScanFromBlock(fallbackBlock.toString());
+        setStatus(
+          `Scan from block был больше текущего блока сети (${latestBlock.toString()}). Сканирую с ${fallbackBlock.toString()}.`
+        );
+      } else {
+        setStatus(
+          `Сканирую NFT-позиции с блока ${fromBlock.toString()} до ${latestBlock.toString()}. Это может занять время.`
+        );
+      }
+
+      let lastProgressAt = 0;
       const ownedPositions = await scanOwnedPositions({
         client,
         owner: account,
         poolId: pool.poolId,
-        fromBlock
+        fromBlock,
+        toBlock: latestBlock,
+        onProgress: (progress) => {
+          const now = Date.now();
+          if (now - lastProgressAt < 1200 && progress.toBlock !== latestBlock) return;
+          lastProgressAt = now;
+          setStatus(
+            `Сканирую Transfer-логи: ${progress.toBlock.toString()} / ${progress.latestBlock.toString()}. Найдено NFT: ${progress.foundTokenIds}.`
+          );
+        }
       });
       setPositions(ownedPositions);
-      setStatus("Готово: сканирование позиций завершено.");
+      setStatus(
+        ownedPositions.length > 0
+          ? `Готово: найдено позиций по этому poolId: ${ownedPositions.length}.`
+          : "Готово: позиции не найдены. Проверьте кошелёк, poolId и Scan from block; если знаете NFT tokenId, добавьте его вручную."
+      );
     } catch (error) {
       setStatus(`Ошибка сканирования: ${(error as Error).message}`);
     } finally {
@@ -1231,8 +1265,8 @@ export function App() {
         <div className="panel-title">
           <Activity size={18} />
           <h2>Позиции</h2>
-          <button onClick={() => refreshPositionsAndApprovals()} disabled={!pool || !account || busy}>
-            Обновить
+          <button onClick={scanPositionsFromLogs} disabled={!pool || !account || busy}>
+            Найти позиции
           </button>
         </div>
         <div className="row">
@@ -1248,8 +1282,12 @@ export function App() {
             Добавить tokenId
           </button>
         </div>
+        <p className="muted">
+          Если позиция не находится автоматически, вставьте её NFT tokenId вручную или поставьте Scan from block
+          раньше блока, где позиция была создана.
+        </p>
         <button onClick={scanPositionsFromLogs} disabled={!pool || !account || busy}>
-          Сканировать Transfer-логи
+          Полный поиск по Transfer-логам
         </button>
         {positions.length === 0 && <p className="muted">Позиции этого кошелька по текущему poolId не найдены.</p>}
         <div className="positions">
