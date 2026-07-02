@@ -1064,6 +1064,10 @@ export function App() {
   const priceLabel = pool ? describePrice(pool) : "Пул ещё не загружен";
   const minRangePercent = pool ? (Math.pow(1.0001, Math.max(1, pool.tickSpacing)) - 1) * 100 : 0.01;
   const lastTradeReadable = pool && lastTrade ? readableTrade(lastTrade, pool.token0, pool.token1) : null;
+  const token0Symbol = pool?.token0.symbol ?? "NES";
+  const token1Symbol = pool?.token1.symbol ?? "USDT";
+  const token0Label = `${token0Symbol} (token0)`;
+  const token1Label = `${token1Symbol} (token1)`;
 
   return (
     <main className="app-shell">
@@ -1165,14 +1169,18 @@ export function App() {
         </div>
         <div className="segmented">
           <button className={mode === "both" ? "active" : ""} onClick={() => setMode("both")}>
-            2 токена
+            2 токена: {token0Symbol} + {token1Symbol}
           </button>
           <button className={mode === "token0" ? "active" : ""} onClick={() => setMode("token0")}>
-            Только {pool?.token0.symbol ?? "token0"}
+            Только {token0Symbol}
           </button>
           <button className={mode === "token1" ? "active" : ""} onClick={() => setMode("token1")}>
-            Только {pool?.token1.symbol ?? "token1"}
+            Только {token1Symbol}
           </button>
+        </div>
+        <div className="token-legend" aria-label="Соответствие токенов">
+          <span>{token0Label}</span>
+          <span>{token1Label}</span>
         </div>
         <div className="grid four">
           <label>
@@ -1180,7 +1188,7 @@ export function App() {
             <input value={offsetPercent} onChange={(event) => setOffsetPercent(event.target.value)} />
           </label>
           <label>
-            {pool?.token0.symbol ?? "Token0"}
+            {token0Label}
             <input
               value={amount0}
               disabled={mode === "token1"}
@@ -1189,7 +1197,7 @@ export function App() {
             />
           </label>
           <label>
-            {pool?.token1.symbol ?? "Token1"}
+            {token1Label}
             <input
               value={amount1}
               disabled={mode === "token0"}

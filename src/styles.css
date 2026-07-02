@@ -481,6 +481,26 @@ h2 {
   box-shadow: 0 8px 18px rgba(118, 69, 217, 0.26);
 }
 
+.token-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: -6px;
+}
+
+.token-legend span {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: #d8faff;
+  background: rgba(31, 199, 212, 0.08);
+  border: 1px solid rgba(31, 199, 212, 0.22);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .positions {
   display: grid;
   gap: 10px;
