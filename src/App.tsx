@@ -333,6 +333,32 @@ export function App() {
     };
   }, [currentPosition, followOffsetPercent, followSide, pool]);
 
+  const atomicPreview = useMemo(() => {
+    if (!pool || !currentPosition) return null;
+    const sell = sellCurrency ? getAddress(sellCurrency) : inferredSellCurrency;
+    const sellIsToken0 = sell.toLowerCase() === pool.token0.address.toLowerCase();
+    const sellToken = sellIsToken0 ? pool.token0 : pool.token1;
+    const buyToken = sellIsToken0 ? pool.token1 : pool.token0;
+    const liquidity = pctToLiquidity(currentPosition.liquidity, exitPercent);
+    const amounts = getAmountsForLiquidity(
+      pool.sqrtPriceX96,
+      getSqrtRatioAtTick(currentPosition.tickLower),
+      getSqrtRatioAtTick(currentPosition.tickUpper),
+      liquidity
+    );
+    const sellAmount = sellIsToken0 ? amounts.amount0 : amounts.amount1;
+
+    return {
+      buyToken,
+      liquidity,
+      poolLabel: `${pool.token0.symbol}/${pool.token1.symbol}`,
+      sellAmount,
+      sellToken,
+      withdrawnAmount0: amounts.amount0,
+      withdrawnAmount1: amounts.amount1
+    };
+  }, [currentPosition, exitPercent, inferredSellCurrency, pool, sellCurrency]);
+
   async function ensureBsc() {
     if (!window.ethereum) throw new Error("MetaMask не найден.");
     const chainId = await window.ethereum.request({ method: "eth_chainId" });
@@ -778,8 +804,24 @@ export function App() {
   }
 
   async function atomicExitAndSell(position: PositionInfo) {
-    if (!walletClient || !account || !pool || !helperAddress || !isAddress(helperAddress)) return;
+    if (!walletClient || !account) {
+      setStatus("Ошибка atomic exit: сначала подключите MetaMask.");
+      return;
+    }
+    if (!pool) {
+      setStatus("Ошибка atomic exit: сначала загрузите пул.");
+      return;
+    }
+    if (!helperAddress || !isAddress(helperAddress)) {
+      setStatus("Ошибка atomic exit: укажите helper contract или нажмите Deploy.");
+      return;
+    }
     try {
+      const approved = await refreshNftApproval(position);
+      if (!approved) {
+        throw new Error("NFT не approved для helper. Нажмите Approve NFT.");
+      }
+
       const sell = sellCurrency ? getAddress(sellCurrency) : inferredSellCurrency;
       const buy =
         sell.toLowerCase() === pool.token0.address.toLowerCase()
@@ -796,6 +838,13 @@ export function App() {
       );
       const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
       const amountOutMin = parseAmount(minOut, buyToken.decimals);
+      const sellAmount =
+        sell.toLowerCase() === pool.token0.address.toLowerCase() ? amounts.amount0 : amounts.amount1;
+      if (sellAmount <= 0n) {
+        throw new Error(
+          `В снимаемой части позиции нет ${sell.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0.symbol : pool.token1.symbol} для продажи. Выберите другой sell token или другой диапазон/процент.`
+        );
+      }
       setBusy(true);
       setStatus("Подтвердите атомарное снятие и продажу в MetaMask...");
       const hash = await writeWithWallet(walletClient, {
@@ -1570,10 +1619,21 @@ export function App() {
           <p className="notice">
             Работает одной транзакцией: снять ликвидность, продать выбранный токен через этот же пул и вернуть остатки.
           </p>
+          {pool && (
+            <div className="facts">
+              <span>Pool: {pool.token0.symbol}/{pool.token1.symbol}</span>
+              <span>Pool ID: {`${pool.poolId.slice(0, 10)}…${pool.poolId.slice(-6)}`}</span>
+              <span>Price: {describePrice(pool)}</span>
+            </div>
+          )}
           <div className="row">
             <label>
               Helper contract
-              <input value={helperAddress} onChange={(event) => setHelperAddress(event.target.value)} />
+              <input
+                value={helperAddress}
+                onChange={(event) => setHelperAddress(event.target.value)}
+                placeholder="0x..."
+              />
             </label>
             <button onClick={deployHelper} disabled={!account || busy}>
               Deploy
@@ -1610,16 +1670,45 @@ export function App() {
               </label>
             </div>
           )}
+          {pool && atomicPreview && (
+            <div className="preview">
+              <span>
+                Sell: {atomicPreview.sellToken.symbol} → {atomicPreview.buyToken.symbol}
+              </span>
+              <span>
+                Remove: {formatTokenAmount(atomicPreview.withdrawnAmount0, pool.token0.decimals, 4)}{" "}
+                {pool.token0.symbol} / {formatTokenAmount(atomicPreview.withdrawnAmount1, pool.token1.decimals, 4)}{" "}
+                {pool.token1.symbol}
+              </span>
+              <span>
+                To sell: {formatTokenAmount(atomicPreview.sellAmount, atomicPreview.sellToken.decimals, 4)}{" "}
+                {atomicPreview.sellToken.symbol}
+              </span>
+              <span>{currentNftApproved ? "NFT approved" : "NFT approve needed"}</span>
+              <span>{atomicPreview.sellAmount > 0n ? "Ready to sell" : "No selected token to sell"}</span>
+            </div>
+          )}
           <div className="row">
-            <button onClick={() => currentPosition && approveNftToHelper(currentPosition)} disabled={!currentPosition || busy}>
-              Approve NFT
+            <button
+              onClick={() => currentPosition && approveNftToHelper(currentPosition)}
+              disabled={!currentPosition || currentNftApproved || busy}
+            >
+              {currentNftApproved ? "NFT approved" : "Approve NFT"}
             </button>
             <button
               className="primary"
               onClick={() => currentPosition && atomicExitAndSell(currentPosition)}
-              disabled={!currentPosition || !pool || !helperAddress || busy}
+              disabled={
+                !currentPosition ||
+                !pool ||
+                !helperAddressValid ||
+                !currentNftApproved ||
+                !atomicPreview ||
+                atomicPreview.sellAmount <= 0n ||
+                busy
+              }
             >
-              Снять и продать
+              Снять и продать за {atomicPreview?.buyToken.symbol ?? "USDT"}
             </button>
           </div>
         </div>
