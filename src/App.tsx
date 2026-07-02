@@ -35,7 +35,8 @@ import {
   DEADLINE_SECONDS,
   DEFAULT_POOL_ID,
   DEFAULT_SCAN_FROM_BLOCK,
-  INFINITY_ADDRESSES
+  INFINITY_ADDRESSES,
+  ZERO_ADDRESS
 } from "./lib/constants";
 import {
   buildBurnPayload,
@@ -74,7 +75,14 @@ import {
 import { atomicExecutorAbi } from "./lib/abis";
 
 type LiquidityMode = "both" | "token0" | "token1";
+type FollowSide = "below" | "above";
 type ApprovalMap = Record<string, ApprovalState>;
+type ReceiptWithLogs = {
+  logs: Array<{ address: Address; topics: readonly Hex[] }>;
+};
+
+const TRANSFER_TOPIC0 =
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" as Hex;
 
 function useStoredState<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => {
@@ -187,6 +195,28 @@ function readableTrade(trade: TradeEvent, token0: TokenInfo, token1: TokenInfo) 
   return { inputToken, outputToken, inputAmount, outputAmount };
 }
 
+function topicToAddress(topic: Hex): Address {
+  return getAddress(`0x${topic.slice(-40)}`);
+}
+
+function computeFollowRange(pool: PoolState, side: FollowSide, offsetPercent: number) {
+  const offset = Math.abs(offsetPercent);
+  return side === "below"
+    ? computeRange(pool, "token1", -offset)
+    : computeRange(pool, "token0", offset);
+}
+
+function extractMintedPositionIds(receipt: ReceiptWithLogs, owner: Address): bigint[] {
+  const ownerLower = owner.toLowerCase();
+  return receipt.logs
+    .filter((log) => log.address.toLowerCase() === INFINITY_ADDRESSES.clPositionManager.toLowerCase())
+    .filter((log) => log.topics[0]?.toLowerCase() === TRANSFER_TOPIC0.toLowerCase())
+    .filter((log) => log.topics[1] && topicToAddress(log.topics[1]).toLowerCase() === ZERO_ADDRESS.toLowerCase())
+    .filter((log) => log.topics[2] && topicToAddress(log.topics[2]).toLowerCase() === ownerLower)
+    .map((log) => BigInt(log.topics[3] ?? 0n))
+    .filter((tokenId) => tokenId > 0n);
+}
+
 export function App() {
   const [rpcUrl, setRpcUrl] = useStoredState("rpcUrl", BSC_RPC_URL);
   const [poolId, setPoolId] = useStoredState("poolId", DEFAULT_POOL_ID);
@@ -221,6 +251,12 @@ export function App() {
   const [lastTrade, setLastTrade] = useState<TradeEvent | null>(null);
   const [rebalanceMinOut, setRebalanceMinOut] = useState("");
   const [rebalanceSafety, setRebalanceSafety] = useState("90");
+  const [followSide, setFollowSide] = useStoredState<FollowSide>("followSide", "below");
+  const [followOffsetPercent, setFollowOffsetPercent] = useStoredState("followOffsetPercent", "0.2");
+  const [followSafety, setFollowSafety] = useStoredState("followSafety", "98");
+  const [followCheckSeconds, setFollowCheckSeconds] = useStoredState("followCheckSeconds", "8");
+  const [followWatching, setFollowWatching] = useState(false);
+  const [followLastCheck, setFollowLastCheck] = useState("Не запущен.");
 
   const client = useMemo(() => createBscClient(rpcUrl), [rpcUrl]);
 
@@ -261,6 +297,23 @@ export function App() {
       return null;
     }
   }, [amount0, amount1, mode, offsetPercent, pool, slippageBps]);
+
+  const followPreview = useMemo(() => {
+    if (!pool) return null;
+    const range = computeFollowRange(pool, followSide, normalizePercent(followOffsetPercent, 0.2));
+    const drift = currentPosition
+      ? Math.max(
+          Math.abs(currentPosition.tickLower - range.tickLower),
+          Math.abs(currentPosition.tickUpper - range.tickUpper)
+        )
+      : 0;
+    return {
+      ...range,
+      drift,
+      needsMove: Boolean(currentPosition && drift >= Math.max(1, pool.tickSpacing)),
+      targetToken: followSide === "below" ? pool.token1 : pool.token0
+    };
+  }, [currentPosition, followOffsetPercent, followSide, pool]);
 
   async function ensureBsc() {
     if (!window.ethereum) throw new Error("MetaMask не найден.");
@@ -381,6 +434,38 @@ export function App() {
     }
   }
 
+  async function addMintedPositionsFromReceipt(
+    receipt: ReceiptWithLogs,
+    removedTokenId?: bigint
+  ) {
+    if (!pool || !account) return;
+    const mintedIds = extractMintedPositionIds(receipt, account);
+    const minted = (
+      await Promise.all(
+        mintedIds.map((tokenId) =>
+          readPositionById({
+            client,
+            tokenId,
+            owner: account,
+            poolId: pool.poolId
+          })
+        )
+      )
+    ).filter((position): position is PositionInfo => Boolean(position));
+
+    if (minted.length === 0 && !removedTokenId) return;
+    setPositions((prev) => {
+      const next = prev.filter((position) => position.tokenId !== removedTokenId);
+      for (const position of minted) {
+        const existingIndex = next.findIndex((item) => item.tokenId === position.tokenId);
+        if (existingIndex >= 0) next[existingIndex] = position;
+        else next.push(position);
+      }
+      return next.sort((a, b) => Number(a.tokenId - b.tokenId));
+    });
+    if (minted[0]) setSelectedPositionId(minted[0].tokenId.toString());
+  }
+
   async function addManualPosition() {
     if (!pool || !account) return;
     try {
@@ -476,8 +561,10 @@ export function App() {
         args: [payload, deadlineFromNow(DEADLINE_SECONDS)],
         account
       });
-      await client.waitForTransactionReceipt({ hash });
-      await refreshPositionsAndApprovals();
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      await addMintedPositionsFromReceipt(receipt as ReceiptWithLogs);
+      const nextPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+      setPool(nextPool);
     } catch (error) {
       setStatus(`Ошибка mint: ${(error as Error).message}`);
     } finally {
@@ -524,7 +611,19 @@ export function App() {
         account
       });
       await client.waitForTransactionReceipt({ hash });
-      await refreshPositionsAndApprovals();
+      const updated = await readPositionById({
+        client,
+        tokenId: position.tokenId,
+        owner: account,
+        poolId: pool.poolId
+      });
+      setPositions((prev) => {
+        if (!updated) return prev.filter((item) => item.tokenId !== position.tokenId);
+        const rest = prev.filter((item) => item.tokenId !== position.tokenId);
+        return [...rest, updated].sort((a, b) => Number(a.tokenId - b.tokenId));
+      });
+      const nextPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+      setPool(nextPool);
     } catch (error) {
       setStatus(`Ошибка снятия: ${(error as Error).message}`);
     } finally {
@@ -620,14 +719,211 @@ export function App() {
         ],
         account
       });
-      await client.waitForTransactionReceipt({ hash });
-      await refreshPositionsAndApprovals();
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      await addMintedPositionsFromReceipt(receipt as ReceiptWithLogs, position.tokenId);
+      const nextPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+      setPool(nextPool);
     } catch (error) {
       setStatus(`Ошибка atomic exit: ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
   }
+
+  async function executeFollowReposition(position: PositionInfo, basePool: PoolState | null = pool) {
+    if (!walletClient || !account || !basePool || !helperAddress || !isAddress(helperAddress)) return;
+    try {
+      const freshPool = await loadPoolState(client, basePool.poolId, basePool.poolKey, account);
+      const freshPosition =
+        (await readPositionById({
+          client,
+          tokenId: position.tokenId,
+          owner: account,
+          poolId: freshPool.poolId
+        })) ?? position;
+      const target = computeFollowRange(
+        freshPool,
+        followSide,
+        normalizePercent(followOffsetPercent, 0.2)
+      );
+      if (
+        freshPosition.tickLower === target.tickLower &&
+        freshPosition.tickUpper === target.tickUpper
+      ) {
+        setPool(freshPool);
+        setFollowLastCheck("Диапазон уже на целевом смещении.");
+        return;
+      }
+
+      const liquidityToRemove = freshPosition.liquidity;
+      const removed = getAmountsForLiquidity(
+        freshPool.sqrtPriceX96,
+        getSqrtRatioAtTick(freshPosition.tickLower),
+        getSqrtRatioAtTick(freshPosition.tickUpper),
+        liquidityToRemove
+      );
+      const price = sqrtPriceX96ToHumanPrice(
+        freshPool.sqrtPriceX96,
+        freshPool.token0.decimals,
+        freshPool.token1.decimals
+      );
+      const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
+      const safety = Math.min(100, Math.max(1, normalizePercent(followSafety, 98)));
+
+      let swapInput = freshPool.token0.address;
+      let swapOutput = freshPool.token1.address;
+      let swapAmountIn = 0n;
+      let swapAmountOutMin = 0n;
+      let amount0After = removed.amount0;
+      let amount1After = removed.amount1;
+
+      if (followSide === "below" && removed.amount0 > 0n) {
+        swapInput = freshPool.token0.address;
+        swapOutput = freshPool.token1.address;
+        swapAmountIn = removed.amount0;
+        const estimatedOutHuman =
+          Number(formatUnits(removed.amount0, freshPool.token0.decimals)) * price;
+        swapAmountOutMin = parseUnits(
+          Math.max(0, estimatedOutHuman * (1 - bps / 10_000)).toFixed(freshPool.token1.decimals),
+          freshPool.token1.decimals
+        );
+        amount0After = 0n;
+        amount1After += swapAmountOutMin;
+      }
+
+      if (followSide === "above" && removed.amount1 > 0n) {
+        swapInput = freshPool.token1.address;
+        swapOutput = freshPool.token0.address;
+        swapAmountIn = removed.amount1;
+        const estimatedOutHuman =
+          Number(formatUnits(removed.amount1, freshPool.token1.decimals)) / price;
+        swapAmountOutMin = parseUnits(
+          Math.max(0, estimatedOutHuman * (1 - bps / 10_000)).toFixed(freshPool.token0.decimals),
+          freshPool.token0.decimals
+        );
+        amount1After = 0n;
+        amount0After += swapAmountOutMin;
+      }
+
+      const mintLiquidity =
+        (getLiquidityForAmounts(
+          freshPool.sqrtPriceX96,
+          getSqrtRatioAtTick(target.tickLower),
+          getSqrtRatioAtTick(target.tickUpper),
+          amount0After,
+          amount1After
+        ) *
+          BigInt(Math.round(safety * 100))) /
+        10_000n;
+
+      if (mintLiquidity <= 0n) {
+        throw new Error("После снятия/обмена не получается заминтить новую позицию.");
+      }
+
+      setBusy(true);
+      setFollowLastCheck("Ожидаю подпись MetaMask для перестановки диапазона.");
+      const hash = await writeWithWallet(walletClient, {
+        address: getAddress(helperAddress),
+        abi: atomicExecutorAbi,
+        functionName: "rebalance",
+        args: [
+          poolKeyToTuple(freshPool.poolKey),
+          freshPosition.tokenId,
+          liquidityToRemove,
+          applySlippageDown(removed.amount0, bps),
+          applySlippageDown(removed.amount1, bps),
+          swapInput,
+          swapOutput,
+          swapAmountIn,
+          swapAmountOutMin,
+          target.tickLower,
+          target.tickUpper,
+          mintLiquidity,
+          amount0After,
+          amount1After,
+          deadlineFromNow(DEADLINE_SECONDS)
+        ],
+        account
+      });
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      await addMintedPositionsFromReceipt(receipt as ReceiptWithLogs, freshPosition.tokenId);
+      const nextPool = await loadPoolState(client, freshPool.poolId, freshPool.poolKey, account);
+      setPool(nextPool);
+      setFollowLastCheck(`Готово: диапазон переставлен в tx ${hash.slice(0, 10)}…`);
+      setStatus("Готово: follow-range переставил ликвидность.");
+    } catch (error) {
+      setFollowLastCheck(`Ошибка: ${(error as Error).message}`);
+      setStatus(`Ошибка follow-range: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!followWatching || !pool || !account || !walletClient || !currentPosition) return;
+    if (!helperAddress || !isAddress(helperAddress)) {
+      setFollowLastCheck("Укажите helper contract и сделайте Approve NFT.");
+      setFollowWatching(false);
+      return;
+    }
+
+    let cancelled = false;
+    const intervalMs = Math.max(3, normalizePercent(followCheckSeconds, 8)) * 1000;
+    const poll = async () => {
+      if (busy || cancelled) return;
+      try {
+        const freshPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+        const freshPosition = await readPositionById({
+          client,
+          tokenId: currentPosition.tokenId,
+          owner: account,
+          poolId: pool.poolId
+        });
+        if (!freshPosition) {
+          setFollowLastCheck("Текущая NFT-позиция больше не активна.");
+          return;
+        }
+        if (cancelled) return;
+        setPool(freshPool);
+        const target = computeFollowRange(
+          freshPool,
+          followSide,
+          normalizePercent(followOffsetPercent, 0.2)
+        );
+        const drift = Math.max(
+          Math.abs(freshPosition.tickLower - target.tickLower),
+          Math.abs(freshPosition.tickUpper - target.tickUpper)
+        );
+        setFollowLastCheck(
+          `Проверено: tick ${freshPool.tick}, цель ${target.tickLower} → ${target.tickUpper}.`
+        );
+        if (drift >= Math.max(1, freshPool.tickSpacing)) {
+          await executeFollowReposition(freshPosition, freshPool);
+        }
+      } catch (error) {
+        setFollowLastCheck(`Ошибка: ${(error as Error).message}`);
+      }
+    };
+
+    const timer = window.setInterval(poll, intervalMs);
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    account,
+    busy,
+    client,
+    currentPosition,
+    followCheckSeconds,
+    followOffsetPercent,
+    followSide,
+    followWatching,
+    helperAddress,
+    pool,
+    walletClient
+  ]);
 
   useEffect(() => {
     if (!watching || !pool) return;
@@ -984,6 +1280,98 @@ export function App() {
               </article>
             );
           })}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <RefreshCcw size={18} />
+          <h2>Follow-price range</h2>
+        </div>
+        <p className="notice">
+          Держит выбранную позицию в минимальном диапазоне на заданном проценте ниже или выше текущей цены.
+        </p>
+        <div className="segmented">
+          <button
+            className={followSide === "below" ? "active" : ""}
+            onClick={() => setFollowSide("below")}
+          >
+            Ниже цены
+          </button>
+          <button
+            className={followSide === "above" ? "active" : ""}
+            onClick={() => setFollowSide("above")}
+          >
+            Выше цены
+          </button>
+          <button
+            onClick={() => {
+              setMode(followSide === "below" ? "token1" : "token0");
+              setOffsetPercent(followSide === "below" ? `-${followOffsetPercent}` : followOffsetPercent);
+            }}
+            disabled={!pool}
+          >
+            Вставить в Add
+          </button>
+        </div>
+        <div className="grid four">
+          <label>
+            Offset, %
+            <input value={followOffsetPercent} onChange={(event) => setFollowOffsetPercent(event.target.value)} />
+          </label>
+          <label>
+            Check, sec
+            <input value={followCheckSeconds} onChange={(event) => setFollowCheckSeconds(event.target.value)} />
+          </label>
+          <label>
+            Mint safety, %
+            <input value={followSafety} onChange={(event) => setFollowSafety(event.target.value)} />
+          </label>
+          <label>
+            Position
+            <select value={selectedPositionId} onChange={(event) => setSelectedPositionId(event.target.value)}>
+              {positions.map((position) => (
+                <option key={position.tokenId.toString()} value={position.tokenId.toString()}>
+                  #{position.tokenId.toString()}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {pool && followPreview && (
+          <div className="preview">
+            <span>
+              Target: {followPreview.tickLower} → {followPreview.tickUpper}
+            </span>
+            <span>
+              Prices: {formatCompact(priceAtTick(followPreview.tickLower, pool.token0.decimals, pool.token1.decimals))} →{" "}
+              {formatCompact(priceAtTick(followPreview.tickUpper, pool.token0.decimals, pool.token1.decimals))}
+            </span>
+            <span>Asset: {followPreview.targetToken.symbol}</span>
+            <span>{followPreview.needsMove ? "Move needed" : "On target"}</span>
+          </div>
+        )}
+        <div className="row">
+          <button onClick={() => currentPosition && approveNftToHelper(currentPosition)} disabled={!currentPosition || busy}>
+            Approve NFT
+          </button>
+          <button
+            className="primary"
+            onClick={() => currentPosition && executeFollowReposition(currentPosition)}
+            disabled={!currentPosition || !pool || !helperAddress || busy}
+          >
+            Переставить сейчас
+          </button>
+        </div>
+        <div className="row">
+          <button
+            className={followWatching ? "danger" : "primary"}
+            onClick={() => setFollowWatching((value) => !value)}
+            disabled={!currentPosition || !pool || !helperAddress}
+          >
+            {followWatching ? "Остановить сервис" : "Запустить сервис"}
+          </button>
+          <div className="service-state">{followLastCheck}</div>
         </div>
       </section>
 

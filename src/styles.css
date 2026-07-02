@@ -230,6 +230,19 @@ h2 {
   line-height: 1.45;
 }
 
+.service-state {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  border: 1px solid #d7dfd3;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #43503f;
+  background: #f8faf6;
+  font-size: 13px;
+  min-width: 0;
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -280,4 +293,3 @@ h2 {
     margin-left: 0;
   }
 }
-
