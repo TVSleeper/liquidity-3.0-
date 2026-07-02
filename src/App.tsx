@@ -1068,14 +1068,23 @@ export function App() {
   return (
     <main className="app-shell">
       <section className="topbar">
-        <div>
-          <h1>NES/USDT Liquidity Console</h1>
-          <p>{priceLabel}</p>
+        <div className="brand-row">
+          <div className="brand-mark" aria-hidden="true">
+            <span />
+          </div>
+          <div>
+            <div className="eyebrow">PancakeSwap Infinity v4</div>
+            <h1>NES/USDT Liquidity</h1>
+            <p>{priceLabel}</p>
+          </div>
         </div>
-        <button className="primary" onClick={connectWallet} disabled={busy}>
-          <Wallet size={18} />
-          {account ? `${account.slice(0, 6)}…${account.slice(-4)}` : "MetaMask"}
-        </button>
+        <div className="top-actions">
+          <span className="network-pill">BNB Chain</span>
+          <button className="primary wallet-button" onClick={connectWallet} disabled={busy}>
+            <Wallet size={18} />
+            {account ? `${account.slice(0, 6)}…${account.slice(-4)}` : "MetaMask"}
+          </button>
+        </div>
       </section>
 
       <section className={statusClass(status)}>
@@ -1149,7 +1158,7 @@ export function App() {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel panel-feature">
         <div className="panel-title">
           <ArrowDownUp size={18} />
           <h2>Добавить концентрированную ликвидность</h2>
@@ -1283,7 +1292,7 @@ export function App() {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel panel-feature">
         <div className="panel-title">
           <RefreshCcw size={18} />
           <h2>Follow-price range</h2>
