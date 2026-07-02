@@ -123,6 +123,10 @@ function tokenKey(token: Address, spender: Address) {
   return `${token.toLowerCase()}-${spender.toLowerCase()}`;
 }
 
+function nftApprovalKey(tokenId: bigint, helper: Address) {
+  return `${tokenId.toString()}-${helper.toLowerCase()}`;
+}
+
 function statusClass(message: string) {
   if (message.toLowerCase().includes("ошибка")) return "status error";
   if (message.toLowerCase().includes("готово")) return "status ok";
@@ -237,6 +241,7 @@ export function App() {
   const [pool, setPool] = useState<PoolState | null>(null);
   const [positions, setPositions] = useState<PositionInfo[]>([]);
   const [approvals, setApprovals] = useState<ApprovalMap>({});
+  const [nftApprovals, setNftApprovals] = useState<Record<string, boolean>>({});
   const [status, setStatus] = useState("Готов к подключению MetaMask.");
   const [busy, setBusy] = useState(false);
 
@@ -270,6 +275,13 @@ export function App() {
     positions.find((item) => item.tokenId.toString() === selectedPositionId) ??
     positions[0] ??
     null;
+  const helperAddressValid = Boolean(helperAddress && isAddress(helperAddress));
+  const normalizedHelperAddress = helperAddressValid ? getAddress(helperAddress) : null;
+  const currentNftApproved =
+    Boolean(currentPosition && normalizedHelperAddress) &&
+    nftApprovals[
+      nftApprovalKey(currentPosition?.tokenId ?? 0n, normalizedHelperAddress ?? ZERO_ADDRESS)
+    ] === true;
 
   const inferredSellCurrency = useMemo(() => {
     if (!pool) return "";
@@ -695,23 +707,73 @@ export function App() {
   }
 
   async function approveNftToHelper(position: PositionInfo) {
-    if (!walletClient || !account || !helperAddress || !isAddress(helperAddress)) return;
+    if (!walletClient || !account) {
+      setStatus("Ошибка NFT approve: сначала подключите MetaMask.");
+      setFollowLastCheck("Сначала подключите MetaMask.");
+      return;
+    }
+    if (!helperAddress || !isAddress(helperAddress)) {
+      setStatus("Ошибка NFT approve: укажите или deploy helper contract.");
+      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
+      return;
+    }
     try {
+      const helper = getAddress(helperAddress);
       setBusy(true);
       setStatus("Подтвердите approve NFT-позиции для helper...");
       const hash = await writeWithWallet(walletClient, {
         address: INFINITY_ADDRESSES.clPositionManager,
         abi: clPositionManagerAbi,
         functionName: "approve",
-        args: [getAddress(helperAddress), position.tokenId],
+        args: [helper, position.tokenId],
         account
       });
       await client.waitForTransactionReceipt({ hash });
+      setNftApprovals((prev) => ({
+        ...prev,
+        [nftApprovalKey(position.tokenId, helper)]: true
+      }));
+      setFollowLastCheck("Готово: NFT approved для helper.");
       setStatus("Готово: helper может управлять этой NFT-позицией по вашему вызову.");
     } catch (error) {
       setStatus(`Ошибка NFT approve: ${(error as Error).message}`);
+      setFollowLastCheck(`Ошибка approve: ${(error as Error).message}`);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function refreshNftApproval(position: PositionInfo): Promise<boolean> {
+    if (!account || !helperAddress || !isAddress(helperAddress)) return false;
+    const helper = getAddress(helperAddress);
+    try {
+      const [approved, approvedForAll] = await Promise.all([
+        client.readContract({
+          address: INFINITY_ADDRESSES.clPositionManager,
+          abi: clPositionManagerAbi,
+          functionName: "getApproved",
+          args: [position.tokenId]
+        }),
+        client.readContract({
+          address: INFINITY_ADDRESSES.clPositionManager,
+          abi: clPositionManagerAbi,
+          functionName: "isApprovedForAll",
+          args: [account, helper]
+        })
+      ]);
+      const isApproved =
+        getAddress(approved).toLowerCase() === helper.toLowerCase() || Boolean(approvedForAll);
+      setNftApprovals((prev) => ({
+        ...prev,
+        [nftApprovalKey(position.tokenId, helper)]: isApproved
+      }));
+      return isApproved;
+    } catch {
+      setNftApprovals((prev) => ({
+        ...prev,
+        [nftApprovalKey(position.tokenId, helper)]: false
+      }));
+      return false;
     }
   }
 
@@ -765,8 +827,28 @@ export function App() {
   }
 
   async function executeFollowReposition(position: PositionInfo, basePool: PoolState | null = pool) {
-    if (!walletClient || !account || !basePool || !helperAddress || !isAddress(helperAddress)) return;
+    if (!walletClient || !account) {
+      setFollowLastCheck("Сначала подключите MetaMask.");
+      setStatus("Ошибка follow-range: сначала подключите MetaMask.");
+      return;
+    }
+    if (!basePool) {
+      setFollowLastCheck("Сначала загрузите пул.");
+      setStatus("Ошибка follow-range: сначала загрузите пул.");
+      return;
+    }
+    if (!helperAddress || !isAddress(helperAddress)) {
+      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
+      setStatus("Ошибка follow-range: helper contract не указан.");
+      return;
+    }
     try {
+      setFollowLastCheck("Проверяю approve NFT для helper...");
+      const approved = await refreshNftApproval(position);
+      if (!approved) {
+        throw new Error("NFT не approved для helper. Нажмите Approve NFT.");
+      }
+
       const freshPool = await loadPoolState(client, basePool.poolId, basePool.poolKey, account);
       const freshPosition =
         (await readPositionById({
@@ -893,6 +975,33 @@ export function App() {
     }
   }
 
+  async function toggleFollowService() {
+    if (followWatching) {
+      setFollowWatching(false);
+      setFollowLastCheck("Сервис остановлен.");
+      return;
+    }
+    if (!currentPosition || !pool) {
+      setFollowLastCheck("Сначала выберите активную позицию и загрузите пул.");
+      return;
+    }
+    if (!walletClient || !account) {
+      setFollowLastCheck("Сначала подключите MetaMask.");
+      return;
+    }
+    if (!helperAddress || !isAddress(helperAddress)) {
+      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
+      return;
+    }
+    const approved = await refreshNftApproval(currentPosition);
+    if (!approved) {
+      setFollowLastCheck("Сначала нажмите Approve NFT для выбранной позиции.");
+      return;
+    }
+    setFollowWatching(true);
+    setFollowLastCheck("Сервис запущен. Проверяю цену и диапазон.");
+  }
+
   useEffect(() => {
     if (!followWatching || !pool || !account || !walletClient || !currentPosition) return;
     if (!helperAddress || !isAddress(helperAddress)) {
@@ -902,7 +1011,7 @@ export function App() {
     }
 
     let cancelled = false;
-    const intervalMs = Math.max(3, normalizePercent(followCheckSeconds, 8)) * 1000;
+    const intervalMs = Math.max(1, normalizePercent(followCheckSeconds, 8)) * 1000;
     const poll = async () => {
       if (busy || cancelled) return;
       try {
@@ -958,6 +1067,11 @@ export function App() {
     pool,
     walletClient
   ]);
+
+  useEffect(() => {
+    if (!currentPosition || !account || !helperAddress || !isAddress(helperAddress)) return;
+    void refreshNftApproval(currentPosition);
+  }, [account, client, currentPosition?.tokenId, helperAddress]);
 
   useEffect(() => {
     if (!watching || !pool) return;
@@ -1393,6 +1507,19 @@ export function App() {
             </select>
           </label>
         </div>
+        <div className="row">
+          <label>
+            Helper contract
+            <input
+              value={helperAddress}
+              onChange={(event) => setHelperAddress(event.target.value)}
+              placeholder="0x..."
+            />
+          </label>
+          <button onClick={deployHelper} disabled={!account || busy}>
+            Deploy helper
+          </button>
+        </div>
         {pool && followPreview && (
           <div className="preview">
             <span>
@@ -1404,16 +1531,20 @@ export function App() {
             </span>
             <span>Asset: {followPreview.targetToken.symbol}</span>
             <span>{followPreview.needsMove ? "Move needed" : "On target"}</span>
+            <span>{currentNftApproved ? "NFT approved" : "NFT approve needed"}</span>
           </div>
         )}
         <div className="row">
-          <button onClick={() => currentPosition && approveNftToHelper(currentPosition)} disabled={!currentPosition || busy}>
-            Approve NFT
+          <button
+            onClick={() => currentPosition && approveNftToHelper(currentPosition)}
+            disabled={!currentPosition || currentNftApproved || busy}
+          >
+            {currentNftApproved ? "NFT approved" : "Approve NFT"}
           </button>
           <button
             className="primary"
             onClick={() => currentPosition && executeFollowReposition(currentPosition)}
-            disabled={!currentPosition || !pool || !helperAddress || busy}
+            disabled={!currentPosition || !pool || !currentNftApproved || busy}
           >
             Переставить сейчас
           </button>
@@ -1421,8 +1552,8 @@ export function App() {
         <div className="row">
           <button
             className={followWatching ? "danger" : "primary"}
-            onClick={() => setFollowWatching((value) => !value)}
-            disabled={!currentPosition || !pool || !helperAddress}
+            onClick={toggleFollowService}
+            disabled={!currentPosition || !pool || busy}
           >
             {followWatching ? "Остановить сервис" : "Запустить сервис"}
           </button>
