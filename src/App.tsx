@@ -841,6 +841,7 @@ export function App() {
       const receipt = await client.waitForTransactionReceipt({ hash });
       if (!receipt.contractAddress) throw new Error("Контракт не вернул адрес.");
       setHelperAddress(receipt.contractAddress);
+      setFollowLastCheck("Helper готов. Теперь нажмите Approve NFT для выбранной позиции.");
       setStatus("Готово: helper-контракт развернут и сохранен.");
     } catch (error) {
       setStatus(`Ошибка helper deploy: ${(error as Error).message}`);
@@ -1908,6 +1909,24 @@ export function App() {
               </select>
             </label>
           </div>
+          <div className="row">
+            <label>
+              Helper contract для перестановки
+              <input
+                value={helperAddress}
+                onChange={(event) => setHelperAddress(event.target.value)}
+                placeholder="0x..."
+              />
+            </label>
+            <button onClick={deployHelper} disabled={!account || busy}>
+              Создать helper
+            </button>
+          </div>
+          <div className="preview">
+            <span>{helperAddressValid ? "Helper готов" : "Нужен helper"}</span>
+            <span>{currentPosition ? `Позиция #${currentPosition.tokenId.toString()}` : "Выберите позицию"}</span>
+            <span>{currentNftApproved ? "NFT разрешен" : "Нужен Approve NFT"}</span>
+          </div>
           {pool && managedPreview && (
             <div className="preview">
               <span>
@@ -1977,7 +1996,7 @@ export function App() {
           <div className="row">
             <button
               onClick={() => currentPosition && approveNftToHelper(currentPosition)}
-              disabled={!currentPosition || currentNftApproved || busy}
+              disabled={!currentPosition || !helperAddressValid || currentNftApproved || busy}
             >
               {currentNftApproved ? "NFT approved" : "Approve NFT"}
             </button>
@@ -1999,7 +2018,7 @@ export function App() {
             <button
               className={followWatching ? "danger" : "primary"}
               onClick={startManagedRangeService}
-              disabled={!currentPosition || !pool || busy}
+              disabled={!currentPosition || !pool || !helperAddressValid || !currentNftApproved || busy}
             >
               {followWatching ? "Остановить удержание" : "Держать диапазон"}
             </button>
