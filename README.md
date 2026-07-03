@@ -77,6 +77,7 @@ cp bot/env.example .env
 - `OWNER_ADDRESS`: ваш основной кошелёк, который сможет вывести средства.
 - `SIDE`: `below` для USDT ниже цены или `above` для NES выше цены.
 - `OFFSET_PERCENT`: отступ от текущей цены.
+- `MINT_MAX_BUFFER_BPS`: небольшой запас для округления PancakeSwap при повторном mint, по умолчанию `5`.
 - `DRY_RUN=true` сначала оставьте включённым.
 
 Деплой strategy:

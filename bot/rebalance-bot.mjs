@@ -2,6 +2,7 @@ import { formatGwei, getAddress } from "viem";
 import {
   DEFAULT_POOL_ID,
   applySlippageDown,
+  applySlippageUp,
   clPositionManagerAbi,
   computeFollowRange,
   createClients,
@@ -33,6 +34,7 @@ const offsetPercent = envNumber("OFFSET_PERCENT", 0.2);
 const checkSeconds = Math.max(1, envNumber("CHECK_SECONDS", 3));
 const slippageBps = Math.max(0, Math.floor(envNumber("SLIPPAGE_BPS", 50)));
 const mintSafetyPercent = Math.min(100, Math.max(1, envNumber("MINT_SAFETY_PERCENT", 100)));
+const mintMaxBufferBps = Math.max(0, Math.floor(envNumber("MINT_MAX_BUFFER_BPS", 5)));
 const rebalanceTickThreshold = Math.max(1, envNumber("REBALANCE_TICK_THRESHOLD", 0));
 const maxGasGwei = envNumber("MAX_GAS_GWEI", 0);
 const dryRun = envBoolean("DRY_RUN", true);
@@ -52,6 +54,7 @@ console.log(`Strategy: ${strategyAddress}`);
 console.log(`Pool:     ${poolId}`);
 console.log(`Mode:     ${side}, offset ${offsetPercent}%, check ${checkSeconds}s`);
 console.log(`Safety:   mint ${mintSafetyPercent}%, slippage ${slippageBps} bps`);
+console.log(`Mint max: +${mintMaxBufferBps} bps buffer`);
 console.log(`Dry run:  ${dryRun ? "yes" : "no"}`);
 console.log("");
 
@@ -188,8 +191,8 @@ async function buildRebalance() {
       target.tickLower,
       target.tickUpper,
       mintLiquidity,
-      amount0After,
-      amount1After,
+      applySlippageUp(amount0After, mintMaxBufferBps),
+      applySlippageUp(amount1After, mintMaxBufferBps),
       deadlineFromNow(deadlineSeconds)
     ],
     summary: {

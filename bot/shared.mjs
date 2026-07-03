@@ -388,6 +388,11 @@ export function applySlippageDown(amount, bps) {
   return (amount * BigInt(10_000 - bps)) / 10_000n;
 }
 
+export function applySlippageUp(amount, bps) {
+  if (amount === 0n) return 0n;
+  return (amount * BigInt(10_000 + bps) + 9_999n) / 10_000n;
+}
+
 export function sqrtPriceX96ToHumanPrice(sqrtPriceX96, decimals0, decimals1) {
   const raw = Number(sqrtPriceX96) / 2 ** 96;
   return raw * raw * 10 ** (decimals0 - decimals1);
