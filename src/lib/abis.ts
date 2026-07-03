@@ -29,6 +29,7 @@ export const clPositionManagerAbi = parseAbi([
   "function getApproved(uint256 id) view returns (address)",
   "function isApprovedForAll(address owner, address operator) view returns (bool)",
   "function setApprovalForAll(address operator, bool approved)",
+  "function safeTransferFrom(address from, address to, uint256 id)",
   "function getPositionLiquidity(uint256 tokenId) view returns (uint128)",
   "function positions(uint256 tokenId) view returns ((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,int24 tickLower,int24 tickUpper,uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,address subscriber)"
 ]);

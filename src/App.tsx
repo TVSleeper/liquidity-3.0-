@@ -245,6 +245,7 @@ export function App() {
     DEFAULT_SCAN_FROM_BLOCK.toString()
   );
   const [helperAddress, setHelperAddress] = useStoredState("helperAddress", "");
+  const [strategyAddress, setStrategyAddress] = useStoredState("strategyAddress", "");
 
   const [account, setAccount] = useState<Address | null>(null);
   const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
@@ -293,6 +294,7 @@ export function App() {
     null;
   const helperAddressValid = Boolean(helperAddress && isAddress(helperAddress));
   const normalizedHelperAddress = helperAddressValid ? getAddress(helperAddress) : null;
+  const strategyAddressValid = Boolean(strategyAddress && isAddress(strategyAddress));
   const currentNftOperatorApproved =
     Boolean(account && normalizedHelperAddress) &&
     nftOperatorApprovals[
@@ -849,6 +851,37 @@ export function App() {
       setPool(nextPool);
     } catch (error) {
       setStatus(`Ошибка снятия: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function transferPositionToStrategy() {
+    if (!walletClient || !account || !currentPosition) {
+      setStatus("Ошибка strategy transfer: выберите позицию и подключите MetaMask.");
+      return;
+    }
+    if (!strategyAddress || !isAddress(strategyAddress)) {
+      setStatus("Ошибка strategy transfer: укажите strategy contract.");
+      return;
+    }
+    try {
+      setBusy(true);
+      const strategy = getAddress(strategyAddress);
+      setStatus(`Подтвердите передачу LP NFT #${currentPosition.tokenId.toString()} в strategy contract...`);
+      const hash = await writeWithWallet(walletClient, {
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "safeTransferFrom",
+        args: [account, strategy, currentPosition.tokenId],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      setPositions((prev) => prev.filter((position) => position.tokenId !== currentPosition.tokenId));
+      setSelectedPositionId("");
+      setStatus("Готово: LP NFT передана в strategy. Теперь автономный бот сможет управлять этой позицией.");
+    } catch (error) {
+      setStatus(`Ошибка strategy transfer: ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -2007,10 +2040,27 @@ export function App() {
               Создать helper
             </button>
           </div>
+          <div className="row">
+            <label>
+              Strategy contract для автономного бота
+              <input
+                value={strategyAddress}
+                onChange={(event) => setStrategyAddress(event.target.value)}
+                placeholder="0x..."
+              />
+            </label>
+            <button
+              onClick={transferPositionToStrategy}
+              disabled={!currentPosition || !account || !strategyAddressValid || busy}
+            >
+              Передать NFT в strategy
+            </button>
+          </div>
           <div className="preview">
             <span>{helperAddressValid ? "Helper готов" : "Нужен helper"}</span>
             <span>{currentPosition ? `Позиция #${currentPosition.tokenId.toString()}` : "Выберите позицию"}</span>
             <span>{nftApprovalLabel}</span>
+            <span>{strategyAddressValid ? "Strategy готова" : "Strategy не указана"}</span>
             <span>Перестановка: 100%</span>
           </div>
           {pool && managedPreview && (

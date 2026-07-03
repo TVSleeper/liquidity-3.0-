@@ -7,7 +7,10 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "compile:executor": "node scripts/compile-atomic-executor.mjs"
+    "compile:contracts": "node scripts/compile-contracts.mjs",
+    "compile:executor": "node scripts/compile-atomic-executor.mjs",
+    "bot:deploy": "node bot/deploy-strategy.mjs",
+    "bot:run": "node bot/rebalance-bot.mjs"
   },
   "dependencies": {
     "@pancakeswap/infinity-sdk": "^1.0.8",

@@ -6,7 +6,7 @@
 
 ```bash
 npm install
-npm run compile:executor
+npm run compile:contracts
 npm run dev
 ```
 
@@ -23,6 +23,7 @@ npm run dev
 - Атомарный сценарий `снять ликвидность -> продать выбранный токен -> вернуть остатки`.
 - Монитор swap-событий и подготовка атомарного rebalance-транзакта.
 - Follow-price range service: автоматическая перестановка выбранной NFT-позиции на заданный процент ниже/выше текущей цены.
+- Autonomous keeper bot: отдельный локальный бот без MetaMask, который вызывает rebalance через strategy contract.
 
 ## Найденные параметры NES/USDT pool
 
@@ -53,6 +54,53 @@ npm run dev
 - `Mint safety, %`: запас при расчёте новой liquidity, чтобы транзакция реже падала из-за округления/движения цены.
 
 Для работы нужен развернутый `AtomicLiquidityExecutor` и `Approve NFT` для текущей позиции. При каждой автоматической перестановке MetaMask всё равно попросит подпись.
+
+## Автономный keeper-бот
+
+Полностью автономный режим не использует MetaMask для каждой перестановки. Вместо этого:
+
+- `AutonomousRangeStrategy` хранит LP-NFT и остатки NES/USDT.
+- `owner` — ваш основной кошелёк. Только он может поставить паузу и вывести NFT/токены.
+- `keeper` — отдельный hot wallet бота. Он может только запускать `rebalance` в разрешённом `poolId`.
+- `AtomicLiquidityExecutor` выполняет атомарную связку `снять -> swap -> mint`.
+
+Подготовка:
+
+```bash
+npm run compile:contracts
+cp bot/env.example .env
+```
+
+Заполните `.env`:
+
+- `BOT_PRIVATE_KEY`: приватный ключ отдельного bot wallet.
+- `OWNER_ADDRESS`: ваш основной кошелёк, который сможет вывести средства.
+- `SIDE`: `below` для USDT ниже цены или `above` для NES выше цены.
+- `OFFSET_PERCENT`: отступ от текущей цены.
+- `DRY_RUN=true` сначала оставьте включённым.
+
+Деплой strategy:
+
+```bash
+npm run bot:deploy
+```
+
+Скрипт выведет `EXECUTOR_ADDRESS` и `STRATEGY_ADDRESS`; добавьте их в `.env`.
+После этого с owner-кошелька переведите LP NFT на `STRATEGY_ADDRESS`.
+
+Проверочный запуск без транзакций:
+
+```bash
+DRY_RUN=true RUN_ONCE=true npm run bot:run
+```
+
+Автономный запуск:
+
+```bash
+DRY_RUN=false npm run bot:run
+```
+
+Перед реальными суммами проверьте на маленькой позиции. Keeper wallet должен иметь BNB на gas, но не должен хранить ваши основные средства.
 
 ## Если позиции не отображаются
 
