@@ -77,6 +77,11 @@ import { atomicExecutorAbi } from "./lib/abis";
 type LiquidityMode = "both" | "token0" | "token1";
 type FollowSide = "below" | "above";
 type ApprovalMap = Record<string, ApprovalState>;
+type FollowRuntimeSettings = {
+  side: FollowSide;
+  offsetPercent: string;
+  mintSafetyPercent: string;
+};
 type ReceiptWithLogs = {
   logs: Array<{ address: Address; topics: readonly Hex[] }>;
 };
@@ -271,6 +276,7 @@ export function App() {
   const [followSafety, setFollowSafety] = useStoredState("followSafety", "98");
   const [followCheckSeconds, setFollowCheckSeconds] = useStoredState("followCheckSeconds", "8");
   const [followWatching, setFollowWatching] = useState(false);
+  const [followRuntimeSettings, setFollowRuntimeSettings] = useState<FollowRuntimeSettings | null>(null);
   const [followLastCheck, setFollowLastCheck] = useState("Не запущен.");
 
   const client = useMemo(() => createBscClient(rpcUrl), [rpcUrl]);
@@ -996,7 +1002,7 @@ export function App() {
   async function executeFollowReposition(
     position: PositionInfo,
     basePool: PoolState | null = pool,
-    settings?: { side: FollowSide; offsetPercent: string }
+    settings?: { side: FollowSide; offsetPercent: string; mintSafetyPercent?: string }
   ) {
     if (!walletClient || !account) {
       setFollowLastCheck("Сначала подключите MetaMask.");
@@ -1022,6 +1028,7 @@ export function App() {
 
       const side = settings?.side ?? followSide;
       const offsetText = settings?.offsetPercent ?? followOffsetPercent;
+      const mintSafetyText = settings?.mintSafetyPercent ?? followSafety;
       const freshPool = await loadPoolState(client, basePool.poolId, basePool.poolKey, account);
       const freshPosition =
         (await readPositionById({
@@ -1057,7 +1064,7 @@ export function App() {
         freshPool.token1.decimals
       );
       const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
-      const safety = Math.min(100, Math.max(1, normalizePercent(followSafety, 98)));
+      const safety = Math.min(100, Math.max(1, normalizePercent(mintSafetyText, 98)));
 
       let swapInput = freshPool.token0.address;
       let swapOutput = freshPool.token1.address;
@@ -1151,6 +1158,7 @@ export function App() {
   async function toggleFollowService() {
     if (followWatching) {
       setFollowWatching(false);
+      setFollowRuntimeSettings(null);
       setFollowLastCheck("Сервис остановлен.");
       return;
     }
@@ -1171,6 +1179,11 @@ export function App() {
       setFollowLastCheck("Сначала нажмите Approve NFT для выбранной позиции.");
       return;
     }
+    setFollowRuntimeSettings({
+      side: followSide,
+      offsetPercent: followOffsetPercent,
+      mintSafetyPercent: followSafety
+    });
     setFollowWatching(true);
     setFollowLastCheck("Сервис запущен. Проверяю цену и диапазон.");
   }
@@ -1178,6 +1191,7 @@ export function App() {
   async function startManagedRangeService() {
     if (followWatching) {
       setFollowWatching(false);
+      setFollowRuntimeSettings(null);
       setFollowLastCheck("Сервис остановлен.");
       return;
     }
@@ -1200,6 +1214,11 @@ export function App() {
     }
     setFollowSide(managedSide);
     setFollowOffsetPercent(managedOffsetPercent);
+    setFollowRuntimeSettings({
+      side: managedSide,
+      offsetPercent: managedOffsetPercent,
+      mintSafetyPercent: "100"
+    });
     setFollowWatching(true);
     setFollowLastCheck("Сервис запущен с настройками этого блока.");
   }
@@ -1214,6 +1233,11 @@ export function App() {
 
     let cancelled = false;
     const intervalMs = Math.max(1, normalizePercent(followCheckSeconds, 8)) * 1000;
+    const runtimeSettings = followRuntimeSettings ?? {
+      side: followSide,
+      offsetPercent: followOffsetPercent,
+      mintSafetyPercent: followSafety
+    };
     const poll = async () => {
       if (busy || cancelled) return;
       try {
@@ -1232,8 +1256,8 @@ export function App() {
         setPool(freshPool);
         const target = computeFollowRange(
           freshPool,
-          followSide,
-          normalizePercent(followOffsetPercent, 0.2)
+          runtimeSettings.side,
+          normalizePercent(runtimeSettings.offsetPercent, 0.2)
         );
         const drift = Math.max(
           Math.abs(freshPosition.tickLower - target.tickLower),
@@ -1243,7 +1267,7 @@ export function App() {
           `Проверено: tick ${freshPool.tick}, цель ${target.tickLower} → ${target.tickUpper}.`
         );
         if (drift >= Math.max(1, freshPool.tickSpacing)) {
-          await executeFollowReposition(freshPosition, freshPool);
+          await executeFollowReposition(freshPosition, freshPool, runtimeSettings);
         }
       } catch (error) {
         setFollowLastCheck(`Ошибка: ${(error as Error).message}`);
@@ -1263,6 +1287,8 @@ export function App() {
     currentPosition,
     followCheckSeconds,
     followOffsetPercent,
+    followRuntimeSettings,
+    followSafety,
     followSide,
     followWatching,
     helperAddress,
@@ -1926,6 +1952,7 @@ export function App() {
             <span>{helperAddressValid ? "Helper готов" : "Нужен helper"}</span>
             <span>{currentPosition ? `Позиция #${currentPosition.tokenId.toString()}` : "Выберите позицию"}</span>
             <span>{currentNftApproved ? "NFT разрешен" : "Нужен Approve NFT"}</span>
+            <span>Перестановка: 100%</span>
           </div>
           {pool && managedPreview && (
             <div className="preview">
@@ -2006,7 +2033,8 @@ export function App() {
                 currentPosition &&
                 executeFollowReposition(currentPosition, pool, {
                   side: managedSide,
-                  offsetPercent: managedOffsetPercent
+                  offsetPercent: managedOffsetPercent,
+                  mintSafetyPercent: "100"
                 })
               }
               disabled={!currentPosition || !pool || !helperAddressValid || !currentNftApproved || busy}
