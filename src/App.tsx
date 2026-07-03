@@ -81,6 +81,7 @@ type FollowRuntimeSettings = {
   side: FollowSide;
   offsetPercent: string;
   mintSafetyPercent: string;
+  helperAddress: Address;
 };
 type ReceiptWithLogs = {
   logs: Array<{ address: Address; topics: readonly Hex[] }>;
@@ -429,6 +430,16 @@ export function App() {
       managedApproval.erc20Allowance >= managedPreview.amount &&
       managedApproval.permit2Allowance >= managedPreview.amount
   );
+  const managedTokenApprovalLabel = !managedPreview
+    ? "Token approve needed"
+    : managedPreview.amount <= 0n
+      ? "Укажите сумму"
+      : managedTokenApproved
+        ? "Token approved"
+        : "Token approve needed";
+  const managedApproveButtonLabel = managedTokenApproved
+    ? "Token approved"
+    : `Approve ${managedPreview?.targetToken.symbol ?? (managedSide === "below" ? "USDT" : "NES")}`;
 
   const selectedPositionStats = useMemo(() => {
     if (!pool || !currentPosition) return null;
@@ -843,8 +854,8 @@ export function App() {
     }
   }
 
-  async function deployHelper() {
-    if (!walletClient || !account) return;
+  async function deployHelper(): Promise<Address | null> {
+    if (!walletClient || !account) return null;
     try {
       if (atomicExecutorBytecode === "0x") {
         throw new Error("Контракт ещё не скомпилирован. Запустите npm run compile:executor.");
@@ -866,26 +877,31 @@ export function App() {
       setHelperAddress(receipt.contractAddress);
       setFollowLastCheck("Helper готов. Следующий шаг: Approve all NFT для LP-позиций.");
       setStatus("Готово: helper-контракт развернут и сохранен.");
+      return receipt.contractAddress;
     } catch (error) {
       setStatus(`Ошибка helper deploy: ${(error as Error).message}`);
+      return null;
     } finally {
       setBusy(false);
     }
   }
 
-  async function approveAllNftsToHelper(): Promise<boolean> {
+  async function ensureHelperAddress(): Promise<Address | null> {
+    if (helperAddress && isAddress(helperAddress)) return getAddress(helperAddress);
+    setFollowLastCheck("Helper не указан. Сейчас откроется MetaMask для создания helper.");
+    setStatus("Нужно создать helper contract для перестановки диапазона.");
+    return deployHelper();
+  }
+
+  async function approveAllNftsToHelper(helperOverride?: Address): Promise<boolean> {
     if (!walletClient || !account) {
       setStatus("Ошибка NFT approve all: сначала подключите MetaMask.");
       setFollowLastCheck("Сначала подключите MetaMask.");
       return false;
     }
-    if (!helperAddress || !isAddress(helperAddress)) {
-      setStatus("Ошибка NFT approve all: укажите или deploy helper contract.");
-      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
-      return false;
-    }
+    const helper = helperOverride ?? (await ensureHelperAddress());
+    if (!helper) return false;
     try {
-      const helper = getAddress(helperAddress);
       setBusy(true);
       setStatus("Подтвердите Approve all NFT для helper в MetaMask...");
       setFollowLastCheck("Подтвердите Approve all NFT. Это нужно один раз для новых LP-позиций.");
@@ -919,9 +935,13 @@ export function App() {
     }
   }
 
-  async function refreshNftApproval(position: PositionInfo): Promise<boolean> {
-    if (!account || !helperAddress || !isAddress(helperAddress)) return false;
-    const helper = getAddress(helperAddress);
+  async function refreshNftApproval(
+    position: PositionInfo,
+    helperOverride?: Address
+  ): Promise<boolean> {
+    if (!account) return false;
+    const helper = helperOverride ?? (helperAddress && isAddress(helperAddress) ? getAddress(helperAddress) : null);
+    if (!helper) return false;
     try {
       const [approved, approvedForAll] = await Promise.all([
         client.readContract({
@@ -970,15 +990,13 @@ export function App() {
       setStatus("Ошибка atomic exit: сначала загрузите пул.");
       return;
     }
-    if (!helperAddress || !isAddress(helperAddress)) {
-      setStatus("Ошибка atomic exit: укажите helper contract или нажмите Deploy.");
-      return;
-    }
+    const helper = await ensureHelperAddress();
+    if (!helper) return;
     try {
-      const approved = await refreshNftApproval(position);
+      const approved = await refreshNftApproval(position, helper);
       if (!approved) {
         setStatus("NFT не разрешен. Сейчас откроется MetaMask для Approve all NFT...");
-        const approvedNow = await approveAllNftsToHelper();
+        const approvedNow = await approveAllNftsToHelper(helper);
         if (!approvedNow) {
           throw new Error("Approve all NFT не подтвержден. Операция отменена.");
         }
@@ -1010,7 +1028,7 @@ export function App() {
       setBusy(true);
       setStatus("Подтвердите атомарное снятие и продажу в MetaMask...");
       const hash = await writeWithWallet(walletClient, {
-        address: getAddress(helperAddress),
+        address: helper,
         abi: atomicExecutorAbi,
         functionName: "exitAndSwapToCurrency",
         args: [
@@ -1040,7 +1058,7 @@ export function App() {
   async function executeFollowReposition(
     position: PositionInfo,
     basePool: PoolState | null = pool,
-    settings?: { side: FollowSide; offsetPercent: string; mintSafetyPercent?: string }
+    settings?: { side: FollowSide; offsetPercent: string; mintSafetyPercent?: string; helperAddress?: Address }
   ) {
     if (!walletClient || !account) {
       setFollowLastCheck("Сначала подключите MetaMask.");
@@ -1052,17 +1070,14 @@ export function App() {
       setStatus("Ошибка follow-range: сначала загрузите пул.");
       return;
     }
-    if (!helperAddress || !isAddress(helperAddress)) {
-      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
-      setStatus("Ошибка follow-range: helper contract не указан.");
-      return;
-    }
+    const helper = settings?.helperAddress ?? (await ensureHelperAddress());
+    if (!helper) return;
     try {
       setFollowLastCheck("Проверяю approve NFT для helper...");
-      const approved = await refreshNftApproval(position);
+      const approved = await refreshNftApproval(position, helper);
       if (!approved) {
         setFollowLastCheck("NFT не разрешен. Сейчас откроется MetaMask для Approve all NFT.");
-        const approvedNow = await approveAllNftsToHelper();
+        const approvedNow = await approveAllNftsToHelper(helper);
         if (!approvedNow) {
           throw new Error("Approve all NFT не подтвержден. Перестановка отменена.");
         }
@@ -1161,7 +1176,7 @@ export function App() {
       setBusy(true);
       setFollowLastCheck("Ожидаю подпись MetaMask для перестановки диапазона.");
       const hash = await writeWithWallet(walletClient, {
-        address: getAddress(helperAddress),
+        address: helper,
         abi: atomicExecutorAbi,
         functionName: "rebalance",
         args: [
@@ -1212,20 +1227,19 @@ export function App() {
       setFollowLastCheck("Сначала подключите MetaMask.");
       return;
     }
-    if (!helperAddress || !isAddress(helperAddress)) {
-      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
-      return;
-    }
-    const approved = await refreshNftApproval(currentPosition);
+    const helper = await ensureHelperAddress();
+    if (!helper) return;
+    const approved = await refreshNftApproval(currentPosition, helper);
     if (!approved) {
       setFollowLastCheck("Сначала нужно Approve all NFT. Открываю MetaMask...");
-      const approvedNow = await approveAllNftsToHelper();
+      const approvedNow = await approveAllNftsToHelper(helper);
       if (!approvedNow) return;
     }
     setFollowRuntimeSettings({
       side: followSide,
       offsetPercent: followOffsetPercent,
-      mintSafetyPercent: followSafety
+      mintSafetyPercent: followSafety,
+      helperAddress: helper
     });
     setFollowWatching(true);
     setFollowLastCheck("Сервис запущен. Проверяю цену и диапазон.");
@@ -1246,14 +1260,12 @@ export function App() {
       setFollowLastCheck("Сначала подключите MetaMask.");
       return;
     }
-    if (!helperAddress || !isAddress(helperAddress)) {
-      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
-      return;
-    }
-    const approved = await refreshNftApproval(currentPosition);
+    const helper = await ensureHelperAddress();
+    if (!helper) return;
+    const approved = await refreshNftApproval(currentPosition, helper);
     if (!approved) {
       setFollowLastCheck("Сначала нужно Approve all NFT. Открываю MetaMask...");
-      const approvedNow = await approveAllNftsToHelper();
+      const approvedNow = await approveAllNftsToHelper(helper);
       if (!approvedNow) return;
     }
     setFollowSide(managedSide);
@@ -1261,7 +1273,8 @@ export function App() {
     setFollowRuntimeSettings({
       side: managedSide,
       offsetPercent: managedOffsetPercent,
-      mintSafetyPercent: "100"
+      mintSafetyPercent: "100",
+      helperAddress: helper
     });
     setFollowWatching(true);
     setFollowLastCheck("Сервис запущен с настройками этого блока.");
@@ -1269,8 +1282,11 @@ export function App() {
 
   useEffect(() => {
     if (!followWatching || !pool || !account || !walletClient || !currentPosition) return;
-    if (!helperAddress || !isAddress(helperAddress)) {
-      setFollowLastCheck("Укажите helper contract. Approve all NFT будет запрошен автоматически.");
+    const activeHelper =
+      followRuntimeSettings?.helperAddress ??
+      (helperAddress && isAddress(helperAddress) ? getAddress(helperAddress) : null);
+    if (!activeHelper) {
+      setFollowLastCheck("Helper не найден. Запустите сервис снова, чтобы создать helper.");
       setFollowWatching(false);
       return;
     }
@@ -1280,7 +1296,8 @@ export function App() {
     const runtimeSettings = followRuntimeSettings ?? {
       side: followSide,
       offsetPercent: followOffsetPercent,
-      mintSafetyPercent: followSafety
+      mintSafetyPercent: followSafety,
+      helperAddress: activeHelper
     };
     const poll = async () => {
       if (busy || cancelled) return;
@@ -1809,14 +1826,14 @@ export function App() {
         <div className="row">
           <button
             onClick={approveAllNftsToHelper}
-            disabled={!account || !helperAddressValid || currentNftOperatorApproved || busy}
+            disabled={!account || currentNftOperatorApproved || busy}
           >
             {approveAllButtonLabel}
           </button>
           <button
             className="primary"
             onClick={() => currentPosition && executeFollowReposition(currentPosition)}
-            disabled={!currentPosition || !pool || !helperAddressValid || busy}
+            disabled={!currentPosition || !pool || busy}
           >
             Переставить сейчас
           </button>
@@ -1914,7 +1931,7 @@ export function App() {
           <div className="row">
             <button
               onClick={approveAllNftsToHelper}
-              disabled={!account || !helperAddressValid || currentNftOperatorApproved || busy}
+              disabled={!account || currentNftOperatorApproved || busy}
             >
               {approveAllButtonLabel}
             </button>
@@ -1924,7 +1941,6 @@ export function App() {
               disabled={
                 !currentPosition ||
                 !pool ||
-                !helperAddressValid ||
                 !atomicPreview ||
                 atomicPreview.sellAmount <= 0n ||
                 busy
@@ -2008,17 +2024,15 @@ export function App() {
               </span>
               <span>Asset: {managedPreview.targetToken.symbol}</span>
               <span>Liquidity: {managedPreview.liquidity.toString()}</span>
-              <span>{managedTokenApproved ? "Token approved" : "Token approve needed"}</span>
+              <span>{managedTokenApprovalLabel}</span>
             </div>
           )}
           <div className="row">
             <button
               onClick={() => managedPreview && approveForAdd(managedPreview.targetToken.address)}
-              disabled={!pool || !account || !managedPreview || managedTokenApproved || busy}
+              disabled={!pool || !account || !managedPreview || managedPreview.amount <= 0n || managedTokenApproved || busy}
             >
-              {managedTokenApproved
-                ? "Token approved"
-                : `Approve ${managedPreview?.targetToken.symbol ?? (managedSide === "below" ? "USDT" : "NES")}`}
+              {managedApproveButtonLabel}
             </button>
             <button
               className="primary"
@@ -2066,7 +2080,7 @@ export function App() {
           <div className="row">
             <button
               onClick={approveAllNftsToHelper}
-              disabled={!account || !helperAddressValid || currentNftOperatorApproved || busy}
+              disabled={!account || currentNftOperatorApproved || busy}
             >
               {approveAllButtonLabel}
             </button>
@@ -2080,7 +2094,7 @@ export function App() {
                   mintSafetyPercent: "100"
                 })
               }
-              disabled={!currentPosition || !pool || !helperAddressValid || busy}
+              disabled={!currentPosition || !pool || busy}
             >
               Переставить сейчас
             </button>
@@ -2089,7 +2103,7 @@ export function App() {
             <button
               className={followWatching ? "danger" : "primary"}
               onClick={startManagedRangeService}
-              disabled={!currentPosition || !pool || !helperAddressValid || busy}
+              disabled={!currentPosition || !pool || busy}
             >
               {followWatching ? "Остановить удержание" : "Держать диапазон"}
             </button>
