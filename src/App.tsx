@@ -262,6 +262,10 @@ export function App() {
   const [lastTrade, setLastTrade] = useState<TradeEvent | null>(null);
   const [rebalanceMinOut, setRebalanceMinOut] = useState("");
   const [rebalanceSafety, setRebalanceSafety] = useState("90");
+  const [managedSide, setManagedSide] = useStoredState<FollowSide>("managedSide", "below");
+  const [managedOffsetPercent, setManagedOffsetPercent] = useStoredState("managedOffsetPercent", "0.2");
+  const [managedAmount, setManagedAmount] = useState("");
+  const [managedWithdrawPercent, setManagedWithdrawPercent] = useState("100");
   const [followSide, setFollowSide] = useStoredState<FollowSide>("followSide", "below");
   const [followOffsetPercent, setFollowOffsetPercent] = useStoredState("followOffsetPercent", "0.2");
   const [followSafety, setFollowSafety] = useStoredState("followSafety", "98");
@@ -358,6 +362,73 @@ export function App() {
       withdrawnAmount1: amounts.amount1
     };
   }, [currentPosition, exitPercent, inferredSellCurrency, pool, sellCurrency]);
+
+  const managedPreview = useMemo(() => {
+    if (!pool) return null;
+    try {
+      const offset = Math.abs(normalizePercent(managedOffsetPercent, 0.2));
+      const range = computeFollowRange(pool, managedSide, offset);
+      const targetToken = managedSide === "below" ? pool.token1 : pool.token0;
+      const amount = parseAmount(managedAmount, targetToken.decimals);
+      const amount0 = managedSide === "above" ? amount : 0n;
+      const amount1 = managedSide === "below" ? amount : 0n;
+      const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
+      const liquidity = getLiquidityForAmounts(
+        pool.sqrtPriceX96,
+        getSqrtRatioAtTick(range.tickLower),
+        getSqrtRatioAtTick(range.tickUpper),
+        amount0,
+        amount1
+      );
+
+      return {
+        ...range,
+        amount,
+        amount0,
+        amount1,
+        amount0Max: amount0 > 0n ? applySlippageUp(amount0, bps) : 0n,
+        amount1Max: amount1 > 0n ? applySlippageUp(amount1, bps) : 0n,
+        liquidity,
+        targetToken
+      };
+    } catch {
+      return null;
+    }
+  }, [managedAmount, managedOffsetPercent, managedSide, pool, slippageBps]);
+
+  const managedApproval = managedPreview
+    ? approvals[tokenKey(managedPreview.targetToken.address, INFINITY_ADDRESSES.clPositionManager)]
+    : undefined;
+  const managedTokenApproved = Boolean(
+    managedPreview &&
+      managedPreview.amount > 0n &&
+      managedApproval &&
+      managedApproval.erc20Allowance >= managedPreview.amount &&
+      managedApproval.permit2Allowance >= managedPreview.amount
+  );
+
+  const selectedPositionStats = useMemo(() => {
+    if (!pool || !currentPosition) return null;
+    const amounts = getAmountsForLiquidity(
+      pool.sqrtPriceX96,
+      getSqrtRatioAtTick(currentPosition.tickLower),
+      getSqrtRatioAtTick(currentPosition.tickUpper),
+      currentPosition.liquidity
+    );
+    const price = sqrtPriceX96ToHumanPrice(
+      pool.sqrtPriceX96,
+      pool.token0.decimals,
+      pool.token1.decimals
+    );
+    const value0 = Number(formatUnits(amounts.amount0, pool.token0.decimals)) * price;
+    const value1 = Number(formatUnits(amounts.amount1, pool.token1.decimals));
+
+    return {
+      ...amounts,
+      valueUsdt: value0 + value1,
+      inRange: pool.tick >= currentPosition.tickLower && pool.tick < currentPosition.tickUpper
+    };
+  }, [currentPosition, pool]);
 
   async function ensureBsc() {
     if (!window.ethereum) throw new Error("MetaMask не найден.");
@@ -644,11 +715,57 @@ export function App() {
     }
   }
 
-  async function removePosition(position: PositionInfo, burn: boolean) {
+  async function mintManagedPosition() {
+    if (!walletClient || !account || !pool || !managedPreview) return;
+    try {
+      if (managedPreview.amount <= 0n) {
+        throw new Error("Укажите сумму для добавления ликвидности.");
+      }
+      if (managedPreview.liquidity <= 0n) {
+        throw new Error("Ликвидность равна нулю. Проверьте сумму и смещение от цены.");
+      }
+      if (!managedTokenApproved) {
+        throw new Error(`Сначала сделайте Approve для ${managedPreview.targetToken.symbol}.`);
+      }
+
+      setBusy(true);
+      setStatus(
+        `Подтвердите добавление ${managedPreview.targetToken.symbol} в выбранный диапазон в MetaMask...`
+      );
+      const payload = buildMintPayload({
+        poolKey: pool.poolKey,
+        tickLower: managedPreview.tickLower,
+        tickUpper: managedPreview.tickUpper,
+        liquidity: managedPreview.liquidity,
+        amount0Max: managedPreview.amount0Max,
+        amount1Max: managedPreview.amount1Max,
+        owner: account
+      });
+      const hash = await writeWithWallet(walletClient, {
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "modifyLiquidities",
+        args: [payload, deadlineFromNow(DEADLINE_SECONDS)],
+        account
+      });
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      await addMintedPositionsFromReceipt(receipt as ReceiptWithLogs);
+      const nextPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+      setPool(nextPool);
+      setManagedAmount("");
+      setStatus("Готово: ликвидность добавлена в выбранный диапазон.");
+    } catch (error) {
+      setStatus(`Ошибка добавления диапазона: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePosition(position: PositionInfo, burn: boolean, percentOverride?: string) {
     if (!walletClient || !account || !pool) return;
     try {
       setBusy(true);
-      const percent = burn ? "100" : positionPercents[position.tokenId.toString()] ?? "100";
+      const percent = burn ? "100" : percentOverride ?? positionPercents[position.tokenId.toString()] ?? "100";
       const liquidity = burn ? position.liquidity : pctToLiquidity(position.liquidity, percent);
       if (liquidity <= 0n) throw new Error("Выбрано 0 ликвидности.");
       const amounts = getAmountsForLiquidity(
@@ -875,7 +992,11 @@ export function App() {
     }
   }
 
-  async function executeFollowReposition(position: PositionInfo, basePool: PoolState | null = pool) {
+  async function executeFollowReposition(
+    position: PositionInfo,
+    basePool: PoolState | null = pool,
+    settings?: { side: FollowSide; offsetPercent: string }
+  ) {
     if (!walletClient || !account) {
       setFollowLastCheck("Сначала подключите MetaMask.");
       setStatus("Ошибка follow-range: сначала подключите MetaMask.");
@@ -898,6 +1019,8 @@ export function App() {
         throw new Error("NFT не approved для helper. Нажмите Approve NFT.");
       }
 
+      const side = settings?.side ?? followSide;
+      const offsetText = settings?.offsetPercent ?? followOffsetPercent;
       const freshPool = await loadPoolState(client, basePool.poolId, basePool.poolKey, account);
       const freshPosition =
         (await readPositionById({
@@ -908,8 +1031,8 @@ export function App() {
         })) ?? position;
       const target = computeFollowRange(
         freshPool,
-        followSide,
-        normalizePercent(followOffsetPercent, 0.2)
+        side,
+        normalizePercent(offsetText, 0.2)
       );
       if (
         freshPosition.tickLower === target.tickLower &&
@@ -942,7 +1065,7 @@ export function App() {
       let amount0After = removed.amount0;
       let amount1After = removed.amount1;
 
-      if (followSide === "below" && removed.amount0 > 0n) {
+      if (side === "below" && removed.amount0 > 0n) {
         swapInput = freshPool.token0.address;
         swapOutput = freshPool.token1.address;
         swapAmountIn = removed.amount0;
@@ -956,7 +1079,7 @@ export function App() {
         amount1After += swapAmountOutMin;
       }
 
-      if (followSide === "above" && removed.amount1 > 0n) {
+      if (side === "above" && removed.amount1 > 0n) {
         swapInput = freshPool.token1.address;
         swapOutput = freshPool.token0.address;
         swapAmountIn = removed.amount1;
@@ -1049,6 +1172,35 @@ export function App() {
     }
     setFollowWatching(true);
     setFollowLastCheck("Сервис запущен. Проверяю цену и диапазон.");
+  }
+
+  async function startManagedRangeService() {
+    if (followWatching) {
+      setFollowWatching(false);
+      setFollowLastCheck("Сервис остановлен.");
+      return;
+    }
+    if (!currentPosition || !pool) {
+      setFollowLastCheck("Сначала выберите активную позицию и загрузите пул.");
+      return;
+    }
+    if (!walletClient || !account) {
+      setFollowLastCheck("Сначала подключите MetaMask.");
+      return;
+    }
+    if (!helperAddress || !isAddress(helperAddress)) {
+      setFollowLastCheck("Сначала укажите helper contract или нажмите Deploy helper.");
+      return;
+    }
+    const approved = await refreshNftApproval(currentPosition);
+    if (!approved) {
+      setFollowLastCheck("Сначала нажмите Approve NFT для выбранной позиции.");
+      return;
+    }
+    setFollowSide(managedSide);
+    setFollowOffsetPercent(managedOffsetPercent);
+    setFollowWatching(true);
+    setFollowLastCheck("Сервис запущен с настройками этого блока.");
   }
 
   useEffect(() => {
@@ -1716,44 +1868,154 @@ export function App() {
         <div className="panel">
           <div className="panel-title">
             <RefreshCcw size={18} />
-            <h2>Авто-ребалансировка</h2>
+            <h2>Управление диапазоном</h2>
           </div>
-          <p className="notice">
-            Локальный MetaMask не может сам подписывать сделки и не гарантирует тот же блок после чужого swap. Этот монитор ловит swap-события и готовит атомарный rebalance-транзакт.
-          </p>
-          <div className="row">
-            <button className={watching ? "danger" : "primary"} onClick={() => setWatching((value) => !value)} disabled={!pool}>
-              {watching ? "Остановить monitor" : "Включить monitor"}
+          <div className="segmented">
+            <button
+              className={managedSide === "below" ? "active" : ""}
+              onClick={() => setManagedSide("below")}
+            >
+              Ниже цены • USDT
             </button>
+            <button
+              className={managedSide === "above" ? "active" : ""}
+              onClick={() => setManagedSide("above")}
+            >
+              Выше цены • NES
+            </button>
+          </div>
+          <div className="grid four">
             <label>
-              Mint safety, %
-              <input value={rebalanceSafety} onChange={(event) => setRebalanceSafety(event.target.value)} />
+              Отступ от цены, %
+              <input value={managedOffsetPercent} onChange={(event) => setManagedOffsetPercent(event.target.value)} />
             </label>
+            <label>
+              Сумма {managedPreview?.targetToken.symbol ?? (managedSide === "below" ? "USDT" : "NES")}
+              <input value={managedAmount} onChange={(event) => setManagedAmount(event.target.value)} placeholder="0.0" />
+            </label>
+            <label>
+              Slippage, bps
+              <input value={slippageBps} onChange={(event) => setSlippageBps(event.target.value)} />
+            </label>
+            <label>
+              Position
+              <select value={selectedPositionId} onChange={(event) => setSelectedPositionId(event.target.value)}>
+                {positions.map((position) => (
+                  <option key={position.tokenId.toString()} value={position.tokenId.toString()}>
+                    #{position.tokenId.toString()}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {pool && managedPreview && (
+            <div className="preview">
+              <span>
+                Target: {managedPreview.tickLower} → {managedPreview.tickUpper}
+              </span>
+              <span>
+                Prices: {formatCompact(priceAtTick(managedPreview.tickLower, pool.token0.decimals, pool.token1.decimals))} →{" "}
+                {formatCompact(priceAtTick(managedPreview.tickUpper, pool.token0.decimals, pool.token1.decimals))}
+              </span>
+              <span>Asset: {managedPreview.targetToken.symbol}</span>
+              <span>Liquidity: {managedPreview.liquidity.toString()}</span>
+              <span>{managedTokenApproved ? "Token approved" : "Token approve needed"}</span>
+            </div>
+          )}
+          <div className="row">
+            <button
+              onClick={() => managedPreview && approveForAdd(managedPreview.targetToken.address)}
+              disabled={!pool || !account || !managedPreview || managedTokenApproved || busy}
+            >
+              {managedTokenApproved
+                ? "Token approved"
+                : `Approve ${managedPreview?.targetToken.symbol ?? (managedSide === "below" ? "USDT" : "NES")}`}
+            </button>
+            <button
+              className="primary"
+              onClick={mintManagedPosition}
+              disabled={!pool || !account || !managedPreview || managedPreview.liquidity <= 0n || !managedTokenApproved || busy}
+            >
+              Добавить {managedPreview?.targetToken.symbol ?? "ликвидность"}
+            </button>
+          </div>
+          <div className="position managed-position">
+            <div>
+              <strong>
+                {currentPosition ? `Позиция #${currentPosition.tokenId.toString()}` : "Позиция не выбрана"}
+              </strong>
+              <span>
+                Диапазон: {currentPosition ? `${currentPosition.tickLower} → ${currentPosition.tickUpper}` : "-"}
+              </span>
+              <span>
+                Размер: {selectedPositionStats ? `~${formatCompact(selectedPositionStats.valueUsdt, 4)} USDT` : "-"}
+              </span>
+              {selectedPositionStats && pool ? (
+                <span>
+                  Активы: {formatTokenAmount(selectedPositionStats.amount0, pool.token0.decimals, 4)} {pool.token0.symbol} /{" "}
+                  {formatTokenAmount(selectedPositionStats.amount1, pool.token1.decimals, 4)} {pool.token1.symbol}
+                </span>
+              ) : (
+                <span>Активы: выберите или найдите NFT-позицию</span>
+              )}
+              <span>Доход/fees: точный расчёт при изъятии или collect</span>
+            </div>
+            <label className="small">
+              Изъять, %
+              <input value={managedWithdrawPercent} onChange={(event) => setManagedWithdrawPercent(event.target.value)} />
+            </label>
+            <button
+              onClick={() => currentPosition && removePosition(currentPosition, false, managedWithdrawPercent)}
+              disabled={!currentPosition || busy}
+            >
+              Изъять %
+            </button>
+            <button onClick={() => currentPosition && removePosition(currentPosition, true)} disabled={!currentPosition || busy}>
+              Изъять всё
+            </button>
+          </div>
+          <div className="row">
+            <button
+              onClick={() => currentPosition && approveNftToHelper(currentPosition)}
+              disabled={!currentPosition || currentNftApproved || busy}
+            >
+              {currentNftApproved ? "NFT approved" : "Approve NFT"}
+            </button>
+            <button
+              className="primary"
+              onClick={() =>
+                currentPosition &&
+                executeFollowReposition(currentPosition, pool, {
+                  side: managedSide,
+                  offsetPercent: managedOffsetPercent
+                })
+              }
+              disabled={!currentPosition || !pool || !helperAddressValid || !currentNftApproved || busy}
+            >
+              Переставить сейчас
+            </button>
+          </div>
+          <div className="row">
+            <button
+              className={followWatching ? "danger" : "primary"}
+              onClick={startManagedRangeService}
+              disabled={!currentPosition || !pool || busy}
+            >
+              {followWatching ? "Остановить удержание" : "Держать диапазон"}
+            </button>
+            <div className="service-state">{followLastCheck}</div>
           </div>
           {lastTradeReadable?.inputToken && lastTradeReadable.outputToken && (
             <div className="preview">
-              <span>Block: {lastTrade?.blockNumber.toString()}</span>
+              <span>Последний swap: block {lastTrade?.blockNumber.toString()}</span>
               <span>
-                Input: {formatTokenAmount(lastTradeReadable.inputAmount, lastTradeReadable.inputToken.decimals, 6)}{" "}
-                {lastTradeReadable.inputToken.symbol}
-              </span>
-              <span>
-                Output: {formatTokenAmount(lastTradeReadable.outputAmount, lastTradeReadable.outputToken.decimals, 6)}{" "}
+                {formatTokenAmount(lastTradeReadable.inputAmount, lastTradeReadable.inputToken.decimals, 6)}{" "}
+                {lastTradeReadable.inputToken.symbol} →{" "}
+                {formatTokenAmount(lastTradeReadable.outputAmount, lastTradeReadable.outputToken.decimals, 6)}{" "}
                 {lastTradeReadable.outputToken.symbol}
               </span>
             </div>
           )}
-          <label>
-            Rebalance min out
-            <input value={rebalanceMinOut} onChange={(event) => setRebalanceMinOut(event.target.value)} placeholder="0.0" />
-          </label>
-          <button
-            className="primary wide"
-            onClick={() => currentPosition && executeRebalanceDraft(currentPosition)}
-            disabled={!currentPosition || !lastTrade || !helperAddress || busy}
-          >
-            Подготовить rebalance по последнему swap
-          </button>
         </div>
       </section>
     </main>
