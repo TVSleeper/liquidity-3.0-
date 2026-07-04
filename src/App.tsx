@@ -72,7 +72,6 @@ import {
   atomicExecutorBytecode,
   atomicExecutorCompiledAbi
 } from "./generated/AtomicLiquidityExecutor";
-import { atomicExecutorAbi } from "./lib/abis";
 
 type LiquidityMode = "both" | "token0" | "token1";
 type FollowSide = "below" | "above";
@@ -97,6 +96,24 @@ function assertSuccessfulReceipt(
   if (receipt.status !== "success") {
     throw new Error(`${label} откатилась. Tx: ${receipt.transactionHash ?? fallbackHash}`);
   }
+}
+
+function compactErrorMessage(error: unknown): string {
+  const messages: string[] = [];
+  let current: unknown = error;
+  for (let index = 0; index < 4 && current && typeof current === "object"; index += 1) {
+    const entry = current as {
+      shortMessage?: string;
+      details?: string;
+      message?: string;
+      cause?: unknown;
+    };
+    const message = entry.shortMessage ?? entry.details ?? entry.message;
+    if (message && !messages.includes(message)) messages.push(message);
+    current = entry.cause;
+  }
+  const message = messages[0] ?? String(error);
+  return message.replace(/\s+/g, " ").slice(0, 700);
 }
 
 const TRANSFER_TOPIC0 =
@@ -1264,48 +1281,81 @@ export function App() {
         }
       }
 
+      setStatus("Обновляю цену и позицию перед atomic exit...");
+      const freshPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+      const freshPosition = await readPositionById({
+        client,
+        tokenId: position.tokenId,
+        owner: account,
+        poolId: pool.poolId
+      });
+      if (!freshPosition) {
+        throw new Error("Позиция уже не найдена на кошельке или в ней нет ликвидности. Обновите список позиций.");
+      }
+      setPool(freshPool);
+      setPositions((prev) => {
+        const next = prev.filter((item) => item.tokenId !== freshPosition.tokenId);
+        next.push(freshPosition);
+        return next.sort((a, b) => Number(a.tokenId - b.tokenId));
+      });
+
       const sell = sellCurrency ? getAddress(sellCurrency) : inferredSellCurrency;
       const buy =
-        sell.toLowerCase() === pool.token0.address.toLowerCase()
-          ? pool.token1.address
-          : pool.token0.address;
+        sell.toLowerCase() === freshPool.token0.address.toLowerCase()
+          ? freshPool.token1.address
+          : freshPool.token0.address;
       const sellToken =
-        sell.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0 : pool.token1;
+        sell.toLowerCase() === freshPool.token0.address.toLowerCase() ? freshPool.token0 : freshPool.token1;
       const buyToken =
-        buy.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0 : pool.token1;
-      const liquidity = pctToLiquidity(position.liquidity, exitPercent);
+        buy.toLowerCase() === freshPool.token0.address.toLowerCase() ? freshPool.token0 : freshPool.token1;
+      const liquidity = pctToLiquidity(freshPosition.liquidity, exitPercent);
       const amounts = getAmountsForLiquidity(
-        pool.sqrtPriceX96,
-        getSqrtRatioAtTick(position.tickLower),
-        getSqrtRatioAtTick(position.tickUpper),
+        freshPool.sqrtPriceX96,
+        getSqrtRatioAtTick(freshPosition.tickLower),
+        getSqrtRatioAtTick(freshPosition.tickUpper),
         liquidity
       );
-      const bps = Math.max(0, Math.floor(normalizePercent(slippageBps, 50)));
       const amountOutMin = parseAmount(minOut, buyToken.decimals);
       const sellAmount =
-        sell.toLowerCase() === pool.token0.address.toLowerCase() ? amounts.amount0 : amounts.amount1;
+        sell.toLowerCase() === freshPool.token0.address.toLowerCase() ? amounts.amount0 : amounts.amount1;
       if (sellAmount <= 0n) {
         throw new Error(
-          `В снимаемой части позиции нет ${sellToken.symbol} для продажи. Выберите другой sell token или другой диапазон/процент.`
+          `По свежей цене в снимаемой части позиции нет ${sellToken.symbol} для продажи. Выберите другой sell token или обновите диапазон.`
         );
       }
+
+      const deadline = deadlineFromNow(DEADLINE_SECONDS);
+      const exitArgs = [
+        poolKeyToTuple(freshPool.poolKey),
+        freshPosition.tokenId,
+        liquidity,
+        0n,
+        0n,
+        sell,
+        buy,
+        amountOutMin,
+        deadline
+      ] as const;
+
       setBusy(true);
+      setStatus("Проверяю atomic exit перед открытием MetaMask...");
+      try {
+        await client.simulateContract({
+          address: helper,
+          abi: atomicExecutorCompiledAbi,
+          functionName: "exitAndSwapToCurrency",
+          args: exitArgs,
+          account
+        });
+      } catch (error) {
+        throw new Error(`Предварительная проверка показала revert: ${compactErrorMessage(error)}`);
+      }
       setStatus("Подтвердите атомарное снятие и продажу в MetaMask...");
       const hash = await writeWithWallet(walletClient, {
         address: helper,
-        abi: atomicExecutorAbi,
+        abi: atomicExecutorCompiledAbi,
         functionName: "exitAndSwapToCurrency",
-        args: [
-          poolKeyToTuple(pool.poolKey),
-          position.tokenId,
-          liquidity,
-          applySlippageDown(amounts.amount0, bps),
-          applySlippageDown(amounts.amount1, bps),
-          sell,
-          buy,
-          amountOutMin,
-          deadlineFromNow(DEADLINE_SECONDS)
-        ],
+        args: exitArgs,
         account
       });
       setStatus(`Транзакция отправлена: ${hash}. Жду подтверждение в блоке...`);
@@ -1313,19 +1363,19 @@ export function App() {
       assertSuccessfulReceipt(receipt, hash, "Atomic exit + sell");
       const updatedPosition = await readPositionById({
         client,
-        tokenId: position.tokenId,
+        tokenId: freshPosition.tokenId,
         owner: account,
-        poolId: pool.poolId
+        poolId: freshPool.poolId
       });
       setPositions((prev) => {
-        const next = prev.filter((item) => item.tokenId !== position.tokenId);
+        const next = prev.filter((item) => item.tokenId !== freshPosition.tokenId);
         if (updatedPosition) next.push(updatedPosition);
         return next.sort((a, b) => Number(a.tokenId - b.tokenId));
       });
-      if (!updatedPosition && selectedPositionId === position.tokenId.toString()) {
+      if (!updatedPosition && selectedPositionId === freshPosition.tokenId.toString()) {
         setSelectedPositionId("");
       }
-      const nextPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
+      const nextPool = await loadPoolState(client, freshPool.poolId, freshPool.poolKey, account);
       setPool(nextPool);
       setStatus(
         `Готово: снял ликвидность и продал ${sellToken.symbol} за ${buyToken.symbol}. Tx: ${hash}`
@@ -1459,7 +1509,7 @@ export function App() {
       setFollowLastCheck("Ожидаю подпись MetaMask для перестановки диапазона.");
       const hash = await writeWithWallet(walletClient, {
         address: helper,
-        abi: atomicExecutorAbi,
+        abi: atomicExecutorCompiledAbi,
         functionName: "rebalance",
         args: [
           poolKeyToTuple(freshPool.poolKey),
@@ -1750,7 +1800,7 @@ export function App() {
       setStatus("Подтвердите черновой rebalance-транзакт в MetaMask...");
       const hash = await writeWithWallet(walletClient, {
         address: getAddress(helperAddress),
-        abi: atomicExecutorAbi,
+        abi: atomicExecutorCompiledAbi,
         functionName: "rebalance",
         args: [
           poolKeyToTuple(pool.poolKey),
