@@ -44,6 +44,7 @@ export const clPoolManagerAbi = parseAbi([
 ]);
 
 export const clPositionManagerAbi = parseAbi([
+  "function nextTokenId() view returns (uint256)",
   "function ownerOf(uint256 id) view returns (address)",
   "function positions(uint256 tokenId) view returns ((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,int24 tickLower,int24 tickUpper,uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,address subscriber)",
   "function safeTransferFrom(address from, address to, uint256 id)"
@@ -56,7 +57,8 @@ export const strategyAbi = parseAbi([
   "function owner() view returns (address)",
   "function paused() view returns (bool)",
   "function poolId() view returns (bytes32)",
-  "function rebalance((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,uint256 tokenId,uint128 liquidityToRemove,uint128 amount0Min,uint128 amount1Min,address swapInput,address swapOutput,uint128 swapAmountIn,uint128 swapAmountOutMin,int24 tickLower,int24 tickUpper,uint256 mintLiquidity,uint128 amount0Max,uint128 amount1Max,uint256 deadline)"
+  "function rebalance((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,uint256 tokenId,uint128 liquidityToRemove,uint128 amount0Min,uint128 amount1Min,address swapInput,address swapOutput,uint128 swapAmountIn,uint128 swapAmountOutMin,int24 tickLower,int24 tickUpper,uint256 mintLiquidity,uint128 amount0Max,uint128 amount1Max,uint256 deadline) returns (uint256 newTokenId)",
+  "function setCurrentTokenId(uint256 tokenId)"
 ]);
 
 export const poolKeyAbi = {

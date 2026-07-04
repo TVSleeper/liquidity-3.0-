@@ -15,6 +15,7 @@ import {
   getAmountsForLiquidity,
   getLiquidityForAmounts,
   getSqrtRatioAtTick,
+  INFINITY_ADDRESSES,
   loadPoolState,
   poolKeyToTuple,
   readPositionById,
@@ -41,6 +42,7 @@ const dryRun = envBoolean("DRY_RUN", true);
 const once = envBoolean("RUN_ONCE", false);
 const deadlineSeconds = Math.max(60, envNumber("DEADLINE_SECONDS", 20 * 60));
 const minLiquidity = envBigInt("MIN_LIQUIDITY", 1n);
+const recoveryScanLimit = Math.max(10, Math.floor(envNumber("RECOVERY_SCAN_LIMIT", 500)));
 
 if (!["below", "above"].includes(side)) {
   throw new Error('SIDE must be "below" or "above"');
@@ -81,6 +83,61 @@ async function checkGas() {
   return true;
 }
 
+async function findLatestActiveStrategyPosition(staleTokenId) {
+  const nextTokenId = await publicClient.readContract({
+    address: INFINITY_ADDRESSES.clPositionManager,
+    abi: clPositionManagerAbi,
+    functionName: "nextTokenId"
+  });
+  if (nextTokenId <= 1n) return null;
+
+  const start = nextTokenId - 1n;
+  const limit = BigInt(recoveryScanLimit);
+  const seen = new Set();
+  const candidates = [];
+
+  if (staleTokenId && staleTokenId + 1n < nextTokenId) {
+    const forwardStop = staleTokenId + limit < start ? staleTokenId + limit : start;
+    for (let tokenId = staleTokenId + 1n; tokenId <= forwardStop; tokenId += 1n) {
+      candidates.push(tokenId);
+      seen.add(tokenId.toString());
+    }
+  }
+
+  const backwardStop = start > limit ? start - limit : 1n;
+  for (let tokenId = start; tokenId >= backwardStop; tokenId -= 1n) {
+    if (seen.has(tokenId.toString())) continue;
+    candidates.push(tokenId);
+    seen.add(tokenId.toString());
+  }
+
+  for (let index = 0; index < candidates.length; index += 100) {
+    const batch = candidates.slice(index, index + 100);
+    const owners = await publicClient.multicall({
+      allowFailure: true,
+      contracts: batch.map((tokenId) => ({
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "ownerOf",
+        args: [tokenId]
+      }))
+    });
+
+    for (let ownerIndex = 0; ownerIndex < owners.length; ownerIndex += 1) {
+      const owner = owners[ownerIndex];
+      if (owner.status !== "success") continue;
+      if (getAddress(owner.result) !== strategyAddress) continue;
+      const tokenId = batch[ownerIndex];
+      try {
+        return await readPositionById(publicClient, tokenId, poolId, strategyAddress);
+      } catch {
+        // The strategy can hold old empty NFTs after rebalances; skip them.
+      }
+    }
+  }
+  return null;
+}
+
 async function buildRebalance() {
   const strategyPaused = await publicClient.readContract({
     address: strategyAddress,
@@ -91,7 +148,19 @@ async function buildRebalance() {
 
   const tokenId = await getStrategyTokenId();
   const pool = await loadPoolState(publicClient, poolId, poolKey, strategyAddress);
-  const position = await readPositionById(publicClient, tokenId, poolId, strategyAddress);
+  let position;
+  try {
+    position = await readPositionById(publicClient, tokenId, poolId, strategyAddress);
+  } catch (error) {
+    const active = await findLatestActiveStrategyPosition(tokenId);
+    if (active && active.tokenId !== tokenId) {
+      return {
+        shouldMove: false,
+        reason: `strategy currentTokenId #${tokenId.toString()} is stale or empty. Active strategy NFT appears to be #${active.tokenId.toString()}. In the app: click "Найти active NFT", then "Сохранить tokenId" with owner wallet.`
+      };
+    }
+    throw error;
+  }
   const target = computeFollowRange(pool, side, offsetPercent);
   const threshold = rebalanceTickThreshold || Math.max(1, pool.tickSpacing);
   const drift = Math.max(

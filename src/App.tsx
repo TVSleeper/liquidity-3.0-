@@ -22,7 +22,7 @@ import {
   type WalletClient
 } from "viem";
 import { bsc } from "viem/chains";
-import { clPositionManagerAbi, swapEvent } from "./lib/abis";
+import { autonomousStrategyAbi, clPositionManagerAbi, swapEvent } from "./lib/abis";
 import {
   approvePermit2Spender,
   approveTokenToPermit2,
@@ -246,6 +246,7 @@ export function App() {
   );
   const [helperAddress, setHelperAddress] = useStoredState("helperAddress", "");
   const [strategyAddress, setStrategyAddress] = useStoredState("strategyAddress", "");
+  const [strategyTokenId, setStrategyTokenId] = useStoredState("strategyTokenId", "");
 
   const [account, setAccount] = useState<Address | null>(null);
   const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
@@ -882,6 +883,107 @@ export function App() {
       setStatus("Готово: LP NFT передана в strategy. Теперь автономный бот сможет управлять этой позицией.");
     } catch (error) {
       setStatus(`Ошибка strategy transfer: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function findStrategyActivePosition() {
+    if (!pool || !strategyAddress || !isAddress(strategyAddress)) {
+      setStatus("Ошибка strategy NFT: укажите strategy contract и загрузите пул.");
+      return;
+    }
+    try {
+      setBusy(true);
+      const strategy = getAddress(strategyAddress);
+      setStatus("Ищу активную NFT-позицию внутри strategy...");
+      const nextTokenId = await client.readContract({
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "nextTokenId"
+      });
+      const staleTokenId = await client.readContract({
+        address: strategy,
+        abi: autonomousStrategyAbi,
+        functionName: "currentTokenId"
+      });
+      let active: PositionInfo | null = null;
+      const candidates: bigint[] = [];
+      const seen = new Set<string>();
+      if (staleTokenId > 0n && staleTokenId + 1n < nextTokenId) {
+        const forwardStop = staleTokenId + 500n < nextTokenId - 1n ? staleTokenId + 500n : nextTokenId - 1n;
+        for (let tokenId = staleTokenId + 1n; tokenId <= forwardStop; tokenId += 1n) {
+          candidates.push(tokenId);
+          seen.add(tokenId.toString());
+        }
+      }
+      const stopAt = nextTokenId > 500n ? nextTokenId - 500n : 1n;
+      for (let tokenId = nextTokenId - 1n; tokenId >= stopAt; tokenId -= 1n) {
+        if (seen.has(tokenId.toString())) continue;
+        candidates.push(tokenId);
+        seen.add(tokenId.toString());
+      }
+      for (let index = 0; index < candidates.length && !active; index += 100) {
+        const batch = candidates.slice(index, index + 100);
+        const owners = await client.multicall({
+          allowFailure: true,
+          contracts: batch.map((tokenId) => ({
+            address: INFINITY_ADDRESSES.clPositionManager,
+            abi: clPositionManagerAbi,
+            functionName: "ownerOf",
+            args: [tokenId]
+          }))
+        });
+        for (let ownerIndex = 0; ownerIndex < owners.length; ownerIndex += 1) {
+          const owner = owners[ownerIndex];
+          if (owner.status !== "success") continue;
+          if (getAddress(owner.result as Address) !== strategy) continue;
+          active = await readPositionById({
+            client,
+            tokenId: batch[ownerIndex],
+            owner: strategy,
+            poolId: pool.poolId
+          });
+          if (active) break;
+        }
+      }
+      if (!active) {
+        throw new Error("Активная позиция strategy не найдена среди последних 500 NFT.");
+      }
+      setStrategyTokenId(active.tokenId.toString());
+      setStatus(`Готово: активная NFT strategy найдена, tokenId #${active.tokenId.toString()}.`);
+    } catch (error) {
+      setStatus(`Ошибка поиска strategy NFT: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setStrategyCurrentTokenId() {
+    if (!walletClient || !account || !strategyAddress || !isAddress(strategyAddress)) {
+      setStatus("Ошибка strategy tokenId: подключите MetaMask и укажите strategy contract.");
+      return;
+    }
+    const clean = strategyTokenId.trim();
+    if (!/^\d+$/.test(clean)) {
+      setStatus("Ошибка strategy tokenId: укажите числовой NFT tokenId.");
+      return;
+    }
+    try {
+      setBusy(true);
+      const tokenId = BigInt(clean);
+      setStatus(`Подтвердите установку active tokenId #${tokenId.toString()} в strategy...`);
+      const hash = await writeWithWallet(walletClient, {
+        address: getAddress(strategyAddress),
+        abi: autonomousStrategyAbi,
+        functionName: "setCurrentTokenId",
+        args: [tokenId],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      setStatus(`Готово: strategy теперь смотрит на активную NFT #${tokenId.toString()}.`);
+    } catch (error) {
+      setStatus(`Ошибка установки strategy tokenId: ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -2056,11 +2158,28 @@ export function App() {
               Передать NFT в strategy
             </button>
           </div>
+          <div className="row">
+            <label>
+              Активный tokenId strategy
+              <input
+                value={strategyTokenId}
+                onChange={(event) => setStrategyTokenId(event.target.value)}
+                placeholder="Например 870803"
+              />
+            </label>
+            <button onClick={findStrategyActivePosition} disabled={!pool || !strategyAddressValid || busy}>
+              Найти active NFT
+            </button>
+            <button onClick={setStrategyCurrentTokenId} disabled={!account || !strategyAddressValid || !strategyTokenId || busy}>
+              Сохранить tokenId
+            </button>
+          </div>
           <div className="preview">
             <span>{helperAddressValid ? "Helper готов" : "Нужен helper"}</span>
             <span>{currentPosition ? `Позиция #${currentPosition.tokenId.toString()}` : "Выберите позицию"}</span>
             <span>{nftApprovalLabel}</span>
             <span>{strategyAddressValid ? "Strategy готова" : "Strategy не указана"}</span>
+            <span>{strategyTokenId ? `Strategy NFT #${strategyTokenId}` : "Strategy NFT не найдена"}</span>
             <span>Перестановка: 100%</span>
           </div>
           {pool && managedPreview && (

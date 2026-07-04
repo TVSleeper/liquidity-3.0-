@@ -49,8 +49,14 @@ export const transferEvent = parseAbiItem(
 export const atomicExecutorAbi = parseAbi([
   "constructor(address positionManager, address universalRouter, address permit2)",
   "function exitAndSwapToCurrency((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,uint256 tokenId,uint128 liquidityToRemove,uint128 amount0Min,uint128 amount1Min,address sellCurrency,address buyCurrency,uint128 amountOutMin,uint256 deadline)",
-  "function rebalance((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,uint256 tokenId,uint128 liquidityToRemove,uint128 amount0Min,uint128 amount1Min,address swapInput,address swapOutput,uint128 swapAmountIn,uint128 swapAmountOutMin,int24 tickLower,int24 tickUpper,uint256 mintLiquidity,uint128 amount0Max,uint128 amount1Max,uint256 deadline)",
+  "function rebalance((address currency0,address currency1,address hooks,address poolManager,uint24 fee,bytes32 parameters) poolKey,uint256 tokenId,uint128 liquidityToRemove,uint128 amount0Min,uint128 amount1Min,address swapInput,address swapOutput,uint128 swapAmountIn,uint128 swapAmountOutMin,int24 tickLower,int24 tickUpper,uint256 mintLiquidity,uint128 amount0Max,uint128 amount1Max,uint256 deadline) returns (uint256 newTokenId)",
   "function positionManager() view returns (address)",
   "function universalRouter() view returns (address)",
   "function permit2() view returns (address)"
+]);
+
+export const autonomousStrategyAbi = parseAbi([
+  "function currentTokenId() view returns (uint256)",
+  "function setCurrentTokenId(uint256 tokenId)",
+  "function withdrawCurrentPosition(address to)"
 ]);

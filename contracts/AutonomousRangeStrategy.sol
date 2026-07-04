@@ -31,7 +31,7 @@ interface IAtomicLiquidityExecutor {
         uint128 amount0Max,
         uint128 amount1Max,
         uint256 deadline
-    ) external;
+    ) external returns (uint256 newTokenId);
 }
 
 contract AutonomousRangeStrategy is IERC721Receiver {
@@ -146,7 +146,7 @@ contract AutonomousRangeStrategy is IERC721Receiver {
 
         positionManager.approve(address(executor), tokenId);
         uint256 oldTokenId = currentTokenId;
-        executor.rebalance(
+        uint256 newTokenId = executor.rebalance(
             poolKey,
             tokenId,
             liquidityToRemove,
@@ -163,6 +163,7 @@ contract AutonomousRangeStrategy is IERC721Receiver {
             amount1Max,
             deadline
         );
+        if (newTokenId != 0) currentTokenId = newTokenId;
 
         emit Rebalanced(oldTokenId, currentTokenId, tickLower, tickUpper);
     }

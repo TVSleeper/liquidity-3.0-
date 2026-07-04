@@ -12,6 +12,7 @@ interface IPermit2 {
 }
 
 interface ICLPositionManager {
+    function nextTokenId() external view returns (uint256);
     function ownerOf(uint256 id) external view returns (address);
     function modifyLiquidities(bytes calldata payload, uint256 deadline) external payable;
 }
@@ -94,7 +95,7 @@ contract AtomicLiquidityExecutor {
         uint128 amount0Max,
         uint128 amount1Max,
         uint256 deadline
-    ) external {
+    ) external returns (uint256 newTokenId) {
         _assertOwner(tokenId);
         _decreaseToThis(poolKey, tokenId, liquidityToRemove, amount0Min, amount1Min, deadline);
 
@@ -111,6 +112,7 @@ contract AtomicLiquidityExecutor {
         }
 
         if (mintLiquidity > 0) {
+            newTokenId = positionManager.nextTokenId();
             _approveForPositionManager(poolKey.currency0);
             _approveForPositionManager(poolKey.currency1);
             bytes[] memory params = new bytes[](3);
@@ -202,4 +204,3 @@ contract AtomicLiquidityExecutor {
         if (balance > 0) IERC20(token).transfer(recipient, balance);
     }
 }
-
