@@ -253,6 +253,7 @@ export function App() {
   const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
   const [pool, setPool] = useState<PoolState | null>(null);
   const [positions, setPositions] = useState<PositionInfo[]>([]);
+  const [savedPositionIds, setSavedPositionIds] = useStoredState<string[]>("savedPositionIds", []);
   const [approvals, setApprovals] = useState<ApprovalMap>({});
   const [nftApprovals, setNftApprovals] = useState<Record<string, boolean>>({});
   const [nftOperatorApprovals, setNftOperatorApprovals] = useState<Record<string, boolean>>({});
@@ -331,6 +332,15 @@ export function App() {
       setSelectedPositionId(positions[0].tokenId.toString());
     }
   }, [positions, selectedPositionId]);
+
+  useEffect(() => {
+    if (positions.length === 0) return;
+    setSavedPositionIds((prev) => {
+      const next = new Set(prev);
+      for (const position of positions) next.add(position.tokenId.toString());
+      return [...next].sort((a, b) => Number(BigInt(a) - BigInt(b)));
+    });
+  }, [positions, setSavedPositionIds]);
 
   const preview = useMemo(() => {
     if (!pool) return null;
@@ -545,7 +555,12 @@ export function App() {
     if (!nextPool || !owner) return;
     try {
       setBusy(true);
-      const knownTokenIds = positions.map((position) => position.tokenId);
+      const knownTokenIds = [
+        ...new Set([
+          ...positions.map((position) => position.tokenId.toString()),
+          ...savedPositionIds
+        ])
+      ].map((tokenId) => BigInt(tokenId));
       const [nextPoolState, knownPositions, approval0, approval1] = await Promise.all([
         loadPoolState(nextClient, nextPool.poolId, nextPool.poolKey, owner),
         Promise.all(
@@ -641,6 +656,73 @@ export function App() {
       setStatus("Готово: позиция добавлена.");
     } catch (error) {
       setStatus(`Ошибка tokenId: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function scanRecentPositions() {
+    if (!pool || !account) return;
+    try {
+      setBusy(true);
+      setStatus("Быстро проверяю последние NFT-позиции кошелька...");
+      const nextTokenId = await client.readContract({
+        address: INFINITY_ADDRESSES.clPositionManager,
+        abi: clPositionManagerAbi,
+        functionName: "nextTokenId"
+      });
+      const candidates: bigint[] = [];
+      const stopAt = nextTokenId > 500n ? nextTokenId - 500n : 1n;
+      for (let tokenId = nextTokenId - 1n; tokenId >= stopAt; tokenId -= 1n) candidates.push(tokenId);
+
+      const found: PositionInfo[] = [];
+      for (let index = 0; index < candidates.length; index += 100) {
+        const batch = candidates.slice(index, index + 100);
+        const owners = await client.multicall({
+          allowFailure: true,
+          contracts: batch.map((tokenId) => ({
+            address: INFINITY_ADDRESSES.clPositionManager,
+            abi: clPositionManagerAbi,
+            functionName: "ownerOf",
+            args: [tokenId]
+          }))
+        });
+        const ownedIds = batch.filter((_, ownerIndex) => {
+          const owner = owners[ownerIndex];
+          return owner.status === "success" && getAddress(owner.result as Address) === account;
+        });
+        const positionsInBatch = (
+          await Promise.all(
+            ownedIds.map((tokenId) =>
+              readPositionById({
+                client,
+                tokenId,
+                owner: account,
+                poolId: pool.poolId
+              })
+            )
+          )
+        ).filter((position): position is PositionInfo => Boolean(position));
+        found.push(...positionsInBatch);
+      }
+
+      setPositions((prev) => {
+        const next = [...prev];
+        for (const position of found) {
+          const existingIndex = next.findIndex((item) => item.tokenId === position.tokenId);
+          if (existingIndex >= 0) next[existingIndex] = position;
+          else next.push(position);
+        }
+        return next.sort((a, b) => Number(a.tokenId - b.tokenId));
+      });
+      if (found.at(-1)) setSelectedPositionId(found.at(-1)!.tokenId.toString());
+      setStatus(
+        found.length > 0
+          ? `Готово: найдено свежих позиций: ${found.length}.`
+          : "Свежие позиции не найдены. Если tokenId известен, добавьте его вручную."
+      );
+    } catch (error) {
+      setStatus(`Ошибка быстрого поиска позиций: ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -1855,9 +1937,14 @@ export function App() {
           Если позиция не находится автоматически, вставьте её NFT tokenId вручную или поставьте Scan from block
           раньше блока, где позиция была создана.
         </p>
-        <button onClick={scanPositionsFromLogs} disabled={!pool || !account || busy}>
-          Полный поиск по Transfer-логам
-        </button>
+        <div className="row">
+          <button onClick={scanRecentPositions} disabled={!pool || !account || busy}>
+            Быстро найти последние NFT
+          </button>
+          <button onClick={scanPositionsFromLogs} disabled={!pool || !account || busy}>
+            Полный поиск по Transfer-логам
+          </button>
+        </div>
         {positions.length === 0 && <p className="muted">Позиции этого кошелька по текущему poolId не найдены.</p>}
         <div className="positions">
           {positions.map((position) => {
