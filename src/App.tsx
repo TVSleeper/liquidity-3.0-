@@ -84,8 +84,20 @@ type FollowRuntimeSettings = {
   helperAddress: Address;
 };
 type ReceiptWithLogs = {
+  status?: "success" | "reverted";
+  transactionHash?: Hex;
   logs: Array<{ address: Address; topics: readonly Hex[] }>;
 };
+
+function assertSuccessfulReceipt(
+  receipt: { status?: "success" | "reverted"; transactionHash?: Hex },
+  fallbackHash: Hex,
+  label: string
+) {
+  if (receipt.status !== "success") {
+    throw new Error(`${label} откатилась. Tx: ${receipt.transactionHash ?? fallbackHash}`);
+  }
+}
 
 const TRANSFER_TOPIC0 =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" as Hex;
@@ -1121,6 +1133,7 @@ export function App() {
         account
       });
       const receipt = await client.waitForTransactionReceipt({ hash });
+      assertSuccessfulReceipt(receipt, hash, "Deploy helper");
       if (!receipt.contractAddress) throw new Error("Контракт не вернул адрес.");
       setHelperAddress(receipt.contractAddress);
       setFollowLastCheck("Helper готов. Следующий шаг: Approve all NFT для LP-позиций.");
@@ -1160,7 +1173,8 @@ export function App() {
         args: [helper, true],
         account
       });
-      await client.waitForTransactionReceipt({ hash });
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      assertSuccessfulReceipt(receipt, hash, "Approve all NFT");
       setNftOperatorApprovals((prev) => ({
         ...prev,
         [nftOperatorApprovalKey(account, helper)]: true
@@ -1255,6 +1269,8 @@ export function App() {
         sell.toLowerCase() === pool.token0.address.toLowerCase()
           ? pool.token1.address
           : pool.token0.address;
+      const sellToken =
+        sell.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0 : pool.token1;
       const buyToken =
         buy.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0 : pool.token1;
       const liquidity = pctToLiquidity(position.liquidity, exitPercent);
@@ -1270,7 +1286,7 @@ export function App() {
         sell.toLowerCase() === pool.token0.address.toLowerCase() ? amounts.amount0 : amounts.amount1;
       if (sellAmount <= 0n) {
         throw new Error(
-          `В снимаемой части позиции нет ${sell.toLowerCase() === pool.token0.address.toLowerCase() ? pool.token0.symbol : pool.token1.symbol} для продажи. Выберите другой sell token или другой диапазон/процент.`
+          `В снимаемой части позиции нет ${sellToken.symbol} для продажи. Выберите другой sell token или другой диапазон/процент.`
         );
       }
       setBusy(true);
@@ -1292,10 +1308,28 @@ export function App() {
         ],
         account
       });
+      setStatus(`Транзакция отправлена: ${hash}. Жду подтверждение в блоке...`);
       const receipt = await client.waitForTransactionReceipt({ hash });
-      await addMintedPositionsFromReceipt(receipt as ReceiptWithLogs, position.tokenId);
+      assertSuccessfulReceipt(receipt, hash, "Atomic exit + sell");
+      const updatedPosition = await readPositionById({
+        client,
+        tokenId: position.tokenId,
+        owner: account,
+        poolId: pool.poolId
+      });
+      setPositions((prev) => {
+        const next = prev.filter((item) => item.tokenId !== position.tokenId);
+        if (updatedPosition) next.push(updatedPosition);
+        return next.sort((a, b) => Number(a.tokenId - b.tokenId));
+      });
+      if (!updatedPosition && selectedPositionId === position.tokenId.toString()) {
+        setSelectedPositionId("");
+      }
       const nextPool = await loadPoolState(client, pool.poolId, pool.poolKey, account);
       setPool(nextPool);
+      setStatus(
+        `Готово: снял ликвидность и продал ${sellToken.symbol} за ${buyToken.symbol}. Tx: ${hash}`
+      );
     } catch (error) {
       setStatus(`Ошибка atomic exit: ${(error as Error).message}`);
     } finally {
@@ -2166,15 +2200,15 @@ export function App() {
           {pool && atomicPreview && (
             <div className="preview">
               <span>
-                Sell: {atomicPreview.sellToken.symbol} → {atomicPreview.buyToken.symbol}
+                Продажа: {atomicPreview.sellToken.symbol} → {atomicPreview.buyToken.symbol}
               </span>
               <span>
-                Remove: {formatTokenAmount(atomicPreview.withdrawnAmount0, pool.token0.decimals, 4)}{" "}
+                Снять: {formatTokenAmount(atomicPreview.withdrawnAmount0, pool.token0.decimals, 4)}{" "}
                 {pool.token0.symbol} / {formatTokenAmount(atomicPreview.withdrawnAmount1, pool.token1.decimals, 4)}{" "}
                 {pool.token1.symbol}
               </span>
               <span>
-                To sell: {formatTokenAmount(atomicPreview.sellAmount, atomicPreview.sellToken.decimals, 4)}{" "}
+                Будет продано: {formatTokenAmount(atomicPreview.sellAmount, atomicPreview.sellToken.decimals, 4)}{" "}
                 {atomicPreview.sellToken.symbol}
               </span>
               <span>{nftApprovalLabel}</span>
@@ -2203,7 +2237,9 @@ export function App() {
                 busy
               }
             >
-              Снять и продать за {atomicPreview?.buyToken.symbol ?? "USDT"}
+              {atomicPreview && atomicPreview.sellAmount <= 0n
+                ? `Нет ${atomicPreview.sellToken.symbol} для продажи`
+                : `Снять и продать за ${atomicPreview?.buyToken.symbol ?? "USDT"}`}
             </button>
           </div>
         </div>
