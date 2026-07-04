@@ -370,6 +370,65 @@ h2 {
   margin-left: auto;
 }
 
+.balance-panel {
+  gap: 14px;
+}
+
+.balance-total {
+  display: grid;
+  gap: 5px;
+  padding: 16px;
+  border: 1px solid rgba(31, 199, 212, 0.24);
+  border-radius: 18px;
+  background:
+    linear-gradient(135deg, rgba(31, 199, 212, 0.16), rgba(118, 69, 217, 0.12)),
+    var(--panel-deep);
+}
+
+.balance-total span,
+.balance-card span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.balance-total strong {
+  color: var(--text);
+  font-size: clamp(28px, 4vw, 42px);
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.balance-total small,
+.balance-card small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.balance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.balance-card {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 18px;
+  background: var(--panel-soft);
+}
+
+.balance-card strong {
+  color: #d8faff;
+  font-size: 18px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
 .row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -518,6 +577,7 @@ h2 {
   .topbar,
   .grid.two,
   .grid.four,
+  .balance-grid,
   .row,
   .position {
     grid-template-columns: 1fr;

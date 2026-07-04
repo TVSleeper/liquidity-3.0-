@@ -2,6 +2,7 @@ import {
   Activity,
   ArrowDownUp,
   CheckCircle2,
+  CircleDollarSign,
   CircleDot,
   PlugZap,
   RefreshCcw,
@@ -22,7 +23,7 @@ import {
   type WalletClient
 } from "viem";
 import { bsc } from "viem/chains";
-import { autonomousStrategyAbi, clPositionManagerAbi, swapEvent } from "./lib/abis";
+import { autonomousStrategyAbi, clPositionManagerAbi, erc20Abi, swapEvent } from "./lib/abis";
 import {
   approvePermit2Spender,
   approveTokenToPermit2,
@@ -86,6 +87,22 @@ type ReceiptWithLogs = {
   status?: "success" | "reverted";
   transactionHash?: Hex;
   logs: Array<{ address: Address; topics: readonly Hex[] }>;
+};
+type TokenAmounts = {
+  amount0: bigint;
+  amount1: bigint;
+};
+type BalanceSnapshot = {
+  total: TokenAmounts;
+  totalValue: number;
+  walletFree: TokenAmounts;
+  walletLp: TokenAmounts;
+  walletValue: number;
+  strategyFree: TokenAmounts;
+  strategyLp: TokenAmounts;
+  strategyTokenId: bigint | null;
+  strategyValue: number;
+  updatedAt: string;
 };
 
 function assertSuccessfulReceipt(
@@ -170,6 +187,40 @@ function statusClass(message: string) {
   if (message.toLowerCase().includes("ошибка")) return "status error";
   if (message.toLowerCase().includes("готово")) return "status ok";
   return "status";
+}
+
+function emptyAmounts(): TokenAmounts {
+  return { amount0: 0n, amount1: 0n };
+}
+
+function addAmounts(...items: TokenAmounts[]): TokenAmounts {
+  return items.reduce(
+    (sum, item) => ({
+      amount0: sum.amount0 + item.amount0,
+      amount1: sum.amount1 + item.amount1
+    }),
+    emptyAmounts()
+  );
+}
+
+function positionTokenAmounts(pool: PoolState, position: PositionInfo | null): TokenAmounts {
+  if (!position) return emptyAmounts();
+  return getAmountsForLiquidity(
+    pool.sqrtPriceX96,
+    getSqrtRatioAtTick(position.tickLower),
+    getSqrtRatioAtTick(position.tickUpper),
+    position.liquidity
+  );
+}
+
+function valueInToken1(pool: PoolState, amounts: TokenAmounts): number {
+  const price = sqrtPriceX96ToHumanPrice(pool.sqrtPriceX96, pool.token0.decimals, pool.token1.decimals);
+  return Number(formatUnits(amounts.amount0, pool.token0.decimals)) * price +
+    Number(formatUnits(amounts.amount1, pool.token1.decimals));
+}
+
+function formatValue(value: number, symbol: string) {
+  return `${formatCompact(value, 4)} ${symbol}`;
 }
 
 function computeRange(pool: PoolState, mode: LiquidityMode, offsetPercent: number) {
@@ -291,6 +342,8 @@ export function App() {
   const [liveRefreshCount, setLiveRefreshCount] = useState(0);
   const [liveRefreshLastAt, setLiveRefreshLastAt] = useState("");
   const [liveRefreshStatus, setLiveRefreshStatus] = useState("Ждёт подключение кошелька и пул.");
+  const [balanceSnapshot, setBalanceSnapshot] = useState<BalanceSnapshot | null>(null);
+  const [balanceStatus, setBalanceStatus] = useState("Ждёт подключение кошелька и пул.");
 
   const [mode, setMode] = useState<LiquidityMode>("both");
   const [offsetPercent, setOffsetPercent] = useState("0");
@@ -513,6 +566,107 @@ export function App() {
     };
   }, [currentPosition, pool]);
 
+  async function readTokenPairBalance(nextPool: PoolState, owner: Address | null): Promise<TokenAmounts> {
+    if (!owner) return emptyAmounts();
+    const [balance0, balance1] = await client.multicall({
+      allowFailure: true,
+      contracts: [
+        {
+          address: nextPool.token0.address,
+          abi: erc20Abi,
+          functionName: "balanceOf",
+          args: [owner]
+        },
+        {
+          address: nextPool.token1.address,
+          abi: erc20Abi,
+          functionName: "balanceOf",
+          args: [owner]
+        }
+      ]
+    });
+
+    return {
+      amount0: balance0.status === "success" ? balance0.result : 0n,
+      amount1: balance1.status === "success" ? balance1.result : 0n
+    };
+  }
+
+  async function readStrategyPosition(nextPool: PoolState, strategy: Address | null): Promise<PositionInfo | null> {
+    if (!strategy) return null;
+    const candidates: bigint[] = [];
+    const savedTokenId = strategyTokenId.trim();
+    if (/^\d+$/.test(savedTokenId)) candidates.push(BigInt(savedTokenId));
+
+    const currentTokenId = await client
+      .readContract({
+        address: strategy,
+        abi: autonomousStrategyAbi,
+        functionName: "currentTokenId"
+      })
+      .catch(() => 0n);
+    if (currentTokenId > 0n && !candidates.some((tokenId) => tokenId === currentTokenId)) {
+      candidates.push(currentTokenId);
+    }
+
+    for (const tokenId of candidates) {
+      const position = await readPositionById({
+        client,
+        tokenId,
+        owner: strategy,
+        poolId: nextPool.poolId
+      }).catch(() => null);
+      if (position) return position;
+    }
+
+    return null;
+  }
+
+  async function refreshBalanceSnapshot(
+    nextPool: PoolState | null = pool,
+    owner: Address | null = account,
+    walletPosition: PositionInfo | null = currentPosition
+  ) {
+    if (!nextPool || !owner) {
+      setBalanceSnapshot(null);
+      setBalanceStatus("Ждёт подключение кошелька и пул.");
+      return;
+    }
+
+    try {
+      const strategy = strategyAddressValid ? getAddress(strategyAddress) : null;
+      const [walletFree, strategyFree, strategyPosition] = await Promise.all([
+        readTokenPairBalance(nextPool, owner),
+        readTokenPairBalance(nextPool, strategy),
+        readStrategyPosition(nextPool, strategy)
+      ]);
+      const walletLp = positionTokenAmounts(nextPool, walletPosition);
+      const strategyLp = positionTokenAmounts(nextPool, strategyPosition);
+      const walletTotal = addAmounts(walletFree, walletLp);
+      const strategyTotal = addAmounts(strategyFree, strategyLp);
+      const total = addAmounts(walletTotal, strategyTotal);
+
+      setBalanceSnapshot({
+        total,
+        totalValue: valueInToken1(nextPool, total),
+        walletFree,
+        walletLp,
+        walletValue: valueInToken1(nextPool, walletTotal),
+        strategyFree,
+        strategyLp,
+        strategyTokenId: strategyPosition?.tokenId ?? null,
+        strategyValue: valueInToken1(nextPool, strategyTotal),
+        updatedAt: new Date().toLocaleTimeString("ru-RU", { hour12: false })
+      });
+      if (strategyPosition && strategyTokenId !== strategyPosition.tokenId.toString()) {
+        setStrategyTokenId(strategyPosition.tokenId.toString());
+      }
+      setBalanceStatus("Работает.");
+    } catch (error) {
+      setBalanceStatus(`Ошибка баланса: ${compactErrorMessage(error)}`);
+    }
+  }
+
   async function ensureBsc() {
     if (!window.ethereum) throw new Error("MetaMask не найден.");
     const chainId = await window.ethereum.request({ method: "eth_chainId" });
@@ -574,7 +728,10 @@ export function App() {
       const state = await loadPoolState(client, poolId as Hex, key, account ?? undefined);
       setPool(state);
       setStatus("Пул загружен, диапазоны и балансы готовы.");
-      if (account) await refreshPositionsAndApprovals(client, state, account);
+      if (account) {
+        await refreshPositionsAndApprovals(client, state, account);
+        await refreshBalanceSnapshot(state, account);
+      }
     } catch (error) {
       setStatus(`Ошибка загрузки пула: ${(error as Error).message}`);
     } finally {
@@ -1629,6 +1786,8 @@ export function App() {
   useEffect(() => {
     if (!pool || !account) {
       setLiveRefreshStatus("Ждёт подключение кошелька и пул.");
+      setBalanceSnapshot(null);
+      setBalanceStatus("Ждёт подключение кошелька и пул.");
       return;
     }
 
@@ -1665,6 +1824,7 @@ export function App() {
             setSelectedPositionId("");
           }
         }
+        await refreshBalanceSnapshot(freshPool, account, freshPosition);
         setLiveRefreshCount((value) => value + 1);
         setLiveRefreshLastAt(new Date().toLocaleTimeString("ru-RU", { hour12: false }));
         setLiveRefreshStatus("Работает.");
@@ -1681,7 +1841,7 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [account, client, currentPosition?.tokenId, pool?.poolId, selectedPositionId]);
+  }, [account, client, currentPosition?.tokenId, pool?.poolId, selectedPositionId, strategyAddress, strategyTokenId]);
 
   useEffect(() => {
     if (!followWatching || !pool || !account || !walletClient || !currentPosition) return;
@@ -1934,6 +2094,67 @@ export function App() {
       <section className={statusClass(status)}>
         <CircleDot size={16} />
         <span>{status}</span>
+      </section>
+
+      <section className="panel balance-panel">
+        <div className="panel-title">
+          <CircleDollarSign size={18} />
+          <h2>Баланс</h2>
+          <button onClick={() => void refreshBalanceSnapshot()} disabled={!pool || !account || busy}>
+            Обновить
+          </button>
+        </div>
+        {!pool || !account ? (
+          <p className="muted">Подключите MetaMask и загрузите пул.</p>
+        ) : balanceSnapshot ? (
+          <>
+            <div className="balance-total">
+              <span>Всего сейчас</span>
+              <strong>{formatValue(balanceSnapshot.totalValue, pool.token1.symbol)}</strong>
+              <small>
+                {formatTokenAmount(balanceSnapshot.total.amount0, pool.token0.decimals, 4)} {pool.token0.symbol} +{" "}
+                {formatTokenAmount(balanceSnapshot.total.amount1, pool.token1.decimals, 4)} {pool.token1.symbol}
+              </small>
+            </div>
+            <div className="balance-grid">
+              <article className="balance-card">
+                <span>Кошелек</span>
+                <strong>{formatValue(balanceSnapshot.walletValue, pool.token1.symbol)}</strong>
+                <small>
+                  Свободно: {formatTokenAmount(balanceSnapshot.walletFree.amount0, pool.token0.decimals, 4)}{" "}
+                  {pool.token0.symbol} / {formatTokenAmount(balanceSnapshot.walletFree.amount1, pool.token1.decimals, 4)}{" "}
+                  {pool.token1.symbol}
+                </small>
+                <small>
+                  LP: {formatTokenAmount(balanceSnapshot.walletLp.amount0, pool.token0.decimals, 4)} {pool.token0.symbol} /{" "}
+                  {formatTokenAmount(balanceSnapshot.walletLp.amount1, pool.token1.decimals, 4)} {pool.token1.symbol}
+                </small>
+              </article>
+              <article className="balance-card">
+                <span>Strategy</span>
+                <strong>{formatValue(balanceSnapshot.strategyValue, pool.token1.symbol)}</strong>
+                <small>
+                  Свободно: {formatTokenAmount(balanceSnapshot.strategyFree.amount0, pool.token0.decimals, 4)}{" "}
+                  {pool.token0.symbol} /{" "}
+                  {formatTokenAmount(balanceSnapshot.strategyFree.amount1, pool.token1.decimals, 4)} {pool.token1.symbol}
+                </small>
+                <small>
+                  LP{balanceSnapshot.strategyTokenId ? ` #${balanceSnapshot.strategyTokenId.toString()}` : ""}:{" "}
+                  {formatTokenAmount(balanceSnapshot.strategyLp.amount0, pool.token0.decimals, 4)} {pool.token0.symbol} /{" "}
+                  {formatTokenAmount(balanceSnapshot.strategyLp.amount1, pool.token1.decimals, 4)} {pool.token1.symbol}
+                </small>
+              </article>
+              <article className="balance-card">
+                <span>Цена и обновление</span>
+                <strong>{describePrice(pool)}</strong>
+                <small>Live: {liveRefreshLabel}</small>
+                <small>{balanceSnapshot.updatedAt ? `Обновлено: ${balanceSnapshot.updatedAt}` : balanceStatus}</small>
+              </article>
+            </div>
+          </>
+        ) : (
+          <p className="muted">{balanceStatus}</p>
+        )}
       </section>
 
       <section className="grid two">
