@@ -247,6 +247,7 @@ export function App() {
   const [helperAddress, setHelperAddress] = useStoredState("helperAddress", "");
   const [strategyAddress, setStrategyAddress] = useStoredState("strategyAddress", "");
   const [strategyTokenId, setStrategyTokenId] = useStoredState("strategyTokenId", "");
+  const [strategyWithdrawTo, setStrategyWithdrawTo] = useStoredState("strategyWithdrawTo", "");
 
   const [account, setAccount] = useState<Address | null>(null);
   const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
@@ -984,6 +985,36 @@ export function App() {
       setStatus(`Готово: strategy теперь смотрит на активную NFT #${tokenId.toString()}.`);
     } catch (error) {
       setStatus(`Ошибка установки strategy tokenId: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function withdrawStrategyCurrentPosition() {
+    if (!walletClient || !account || !strategyAddress || !isAddress(strategyAddress)) {
+      setStatus("Ошибка вывода strategy NFT: подключите MetaMask и укажите strategy contract.");
+      return;
+    }
+    const recipient = strategyWithdrawTo.trim() ? strategyWithdrawTo.trim() : account;
+    if (!isAddress(recipient)) {
+      setStatus("Ошибка вывода strategy NFT: укажите корректный адрес получателя.");
+      return;
+    }
+    try {
+      setBusy(true);
+      const to = getAddress(recipient);
+      setStatus(`Подтвердите вывод текущей LP NFT из strategy на ${to}...`);
+      const hash = await writeWithWallet(walletClient, {
+        address: getAddress(strategyAddress),
+        abi: autonomousStrategyAbi,
+        functionName: "withdrawCurrentPosition",
+        args: [to],
+        account
+      });
+      await client.waitForTransactionReceipt({ hash });
+      setStatus(`Готово: текущая LP NFT выведена из strategy на ${to}.`);
+    } catch (error) {
+      setStatus(`Ошибка вывода strategy NFT: ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -2172,6 +2203,19 @@ export function App() {
             </button>
             <button onClick={setStrategyCurrentTokenId} disabled={!account || !strategyAddressValid || !strategyTokenId || busy}>
               Сохранить tokenId
+            </button>
+          </div>
+          <div className="row">
+            <label>
+              Куда вывести NFT из strategy
+              <input
+                value={strategyWithdrawTo}
+                onChange={(event) => setStrategyWithdrawTo(event.target.value)}
+                placeholder={account ?? "0x..."}
+              />
+            </label>
+            <button onClick={withdrawStrategyCurrentPosition} disabled={!account || !strategyAddressValid || busy}>
+              Вывести NFT из strategy
             </button>
           </div>
           <div className="preview">

@@ -89,6 +89,7 @@ npm run bot:deploy
 
 Скрипт выведет `EXECUTOR_ADDRESS` и `STRATEGY_ADDRESS`; добавьте их в `.env`.
 После этого с owner-кошелька переведите LP NFT на `STRATEGY_ADDRESS`.
+Если обновляете старую установку и нужен новый executor, запустите деплой с `FORCE_NEW_EXECUTOR=true`.
 
 Проверочный запуск без транзакций:
 

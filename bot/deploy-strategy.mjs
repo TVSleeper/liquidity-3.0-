@@ -3,6 +3,7 @@ import {
   DEFAULT_POOL_ID,
   INFINITY_ADDRESSES,
   createClients,
+  envBoolean,
   envNumber,
   envString,
   loadArtifact
@@ -14,16 +15,18 @@ const owner = getAddress(envString("OWNER_ADDRESS"));
 const keeper = getAddress(envString("KEEPER_ADDRESS", account.address));
 const poolId = envString("POOL_ID", DEFAULT_POOL_ID);
 const maxTickWidth = Math.trunc(envNumber("MAX_TICK_WIDTH", 1000));
+const forceNewExecutor = envBoolean("FORCE_NEW_EXECUTOR", false);
 
 const atomicArtifact = loadArtifact("AtomicLiquidityExecutor");
 const strategyArtifact = loadArtifact("AutonomousRangeStrategy");
 
-let executorAddress = process.env.EXECUTOR_ADDRESS;
+let executorAddress = forceNewExecutor ? undefined : process.env.EXECUTOR_ADDRESS;
 
 console.log(`Bot deployer: ${account.address}`);
 console.log(`Owner:        ${owner}`);
 console.log(`Keeper:       ${keeper}`);
 console.log(`Pool ID:      ${poolId}`);
+if (forceNewExecutor) console.log("Executor:     deploying new because FORCE_NEW_EXECUTOR=true");
 
 if (!executorAddress) {
   console.log("Deploying AtomicLiquidityExecutor...");
