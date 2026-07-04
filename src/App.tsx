@@ -256,7 +256,7 @@ export function App() {
     "scanFromBlock",
     DEFAULT_SCAN_FROM_BLOCK.toString()
   );
-  const [helperAddress, setHelperAddress] = useStoredState("helperAddress", "");
+  const [helperAddress, setHelperAddress] = useStoredState("helperAddressV2", "");
   const [strategyAddress, setStrategyAddress] = useStoredState("strategyAddress", "");
   const [strategyTokenId, setStrategyTokenId] = useStoredState("strategyTokenId", "");
   const [strategyWithdrawTo, setStrategyWithdrawTo] = useStoredState("strategyWithdrawTo", "");

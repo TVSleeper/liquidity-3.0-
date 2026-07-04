@@ -30,6 +30,14 @@ struct PoolKey {
     bytes32 parameters;
 }
 
+struct CLSwapExactInputSingleParams {
+    PoolKey poolKey;
+    bool zeroForOne;
+    uint128 amountIn;
+    uint128 amountOutMinimum;
+    bytes hookData;
+}
+
 contract AtomicLiquidityExecutor {
     uint256 private constant CL_DECREASE_LIQUIDITY = 0x01;
     uint256 private constant CL_MINT_POSITION = 0x02;
@@ -183,7 +191,15 @@ contract AtomicLiquidityExecutor {
         actions[1] = bytes1(uint8(SETTLE));
         actions[2] = bytes1(uint8(TAKE));
 
-        params[0] = abi.encode(poolKey, input == poolKey.currency0, amountIn, amountOutMin, bytes(""));
+        params[0] = abi.encode(
+            CLSwapExactInputSingleParams({
+                poolKey: poolKey,
+                zeroForOne: input == poolKey.currency0,
+                amountIn: amountIn,
+                amountOutMinimum: amountOutMin,
+                hookData: bytes("")
+            })
+        );
         params[1] = abi.encode(input, OPEN_DELTA, true);
         params[2] = abi.encode(output, recipient, OPEN_DELTA);
 
