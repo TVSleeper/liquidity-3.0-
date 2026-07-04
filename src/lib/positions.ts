@@ -19,18 +19,35 @@ type PositionScanProgress = {
 const MAX_TRANSFER_LOG_BLOCKS = 5_000n;
 const MIN_TRANSFER_LOG_BLOCKS = 50n;
 
+function isNotMintedError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let index = 0; index < 4 && current && typeof current === "object"; index += 1) {
+    const entry = current as { message?: string; shortMessage?: string; details?: string; cause?: unknown };
+    const message = `${entry.shortMessage ?? ""} ${entry.details ?? ""} ${entry.message ?? ""}`;
+    if (message.includes("NOT_MINTED")) return true;
+    current = entry.cause;
+  }
+  return false;
+}
+
 export async function readPositionById(args: {
   client: PublicClient;
   tokenId: bigint;
   poolId?: Hex;
   owner?: Address;
 }): Promise<PositionInfo | null> {
-  const actualOwner = await args.client.readContract({
-    address: INFINITY_ADDRESSES.clPositionManager,
-    abi: clPositionManagerAbi,
-    functionName: "ownerOf",
-    args: [args.tokenId]
-  });
+  const actualOwner = await args.client
+    .readContract({
+      address: INFINITY_ADDRESSES.clPositionManager,
+      abi: clPositionManagerAbi,
+      functionName: "ownerOf",
+      args: [args.tokenId]
+    })
+    .catch((error) => {
+      if (isNotMintedError(error)) return null;
+      throw error;
+    });
+  if (!actualOwner) return null;
   if (args.owner && getAddress(actualOwner) !== getAddress(args.owner)) return null;
 
   const raw = await args.client.readContract({

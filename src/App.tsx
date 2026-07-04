@@ -615,10 +615,10 @@ export function App() {
           spender: INFINITY_ADDRESSES.clPositionManager
         })
       ]);
+      const livePositions = knownPositions.filter((position): position is PositionInfo => Boolean(position));
       setPool(nextPoolState);
-      setPositions(
-        knownPositions.filter((position): position is PositionInfo => Boolean(position))
-      );
+      setPositions(livePositions);
+      setSavedPositionIds(livePositions.map((position) => position.tokenId.toString()));
       setApprovals({
         [tokenKey(nextPool.token0.address, INFINITY_ADDRESSES.clPositionManager)]: approval0,
         [tokenKey(nextPool.token1.address, INFINITY_ADDRESSES.clPositionManager)]: approval1
