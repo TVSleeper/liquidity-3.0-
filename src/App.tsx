@@ -363,11 +363,11 @@ export function App() {
   const [rebalanceMinOut, setRebalanceMinOut] = useState("");
   const [rebalanceSafety, setRebalanceSafety] = useState("90");
   const [managedSide, setManagedSide] = useStoredState<FollowSide>("managedSide", "below");
-  const [managedOffsetPercent, setManagedOffsetPercent] = useStoredState("managedOffsetPercent", "0.2");
+  const [managedOffsetPercent, setManagedOffsetPercent] = useStoredState("managedOffsetPercent", "0");
   const [managedAmount, setManagedAmount] = useState("");
   const [managedWithdrawPercent, setManagedWithdrawPercent] = useState("100");
   const [followSide, setFollowSide] = useStoredState<FollowSide>("followSide", "below");
-  const [followOffsetPercent, setFollowOffsetPercent] = useStoredState("followOffsetPercent", "0.2");
+  const [followOffsetPercent, setFollowOffsetPercent] = useStoredState("followOffsetPercent", "0");
   const [followSafety, setFollowSafety] = useStoredState("followSafety", "98");
   const [followCheckSeconds, setFollowCheckSeconds] = useStoredState("followCheckSeconds", "8");
   const [followWatching, setFollowWatching] = useState(false);
@@ -2613,6 +2613,13 @@ export function App() {
             <label>
               Отступ от цены, %
               <input value={managedOffsetPercent} onChange={(event) => setManagedOffsetPercent(event.target.value)} />
+              <button
+                type="button"
+                className="field-action"
+                onClick={() => setManagedOffsetPercent("0")}
+              >
+                Максимально близко
+              </button>
             </label>
             <label>
               Сумма {managedPreview?.targetToken.symbol ?? (managedSide === "below" ? "USDT" : "NES")}

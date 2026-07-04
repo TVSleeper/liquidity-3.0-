@@ -136,6 +136,21 @@ label {
   min-width: 0;
 }
 
+.field-action {
+  min-height: 34px;
+  width: 100%;
+  border: 1px solid rgba(31, 199, 212, 0.22);
+  border-radius: 999px;
+  background: rgba(31, 199, 212, 0.08);
+  color: #d8faff;
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.field-action:hover:not(:disabled) {
+  background: rgba(31, 199, 212, 0.14);
+}
+
 h1,
 h2,
 p {
