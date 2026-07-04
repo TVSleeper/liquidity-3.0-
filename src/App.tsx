@@ -1991,7 +1991,7 @@ export function App() {
         )}
         <div className="row">
           <button
-            onClick={approveAllNftsToHelper}
+            onClick={() => void approveAllNftsToHelper()}
             disabled={!account || currentNftOperatorApproved || busy}
           >
             {approveAllButtonLabel}
@@ -2091,12 +2091,16 @@ export function App() {
                 {atomicPreview.sellToken.symbol}
               </span>
               <span>{nftApprovalLabel}</span>
-              <span>{atomicPreview.sellAmount > 0n ? "Ready to sell" : "No selected token to sell"}</span>
+              <span>
+                {atomicPreview.sellAmount > 0n
+                  ? "Готово к продаже"
+                  : `В позиции нет ${atomicPreview.sellToken.symbol} для продажи`}
+              </span>
             </div>
           )}
           <div className="row">
             <button
-              onClick={approveAllNftsToHelper}
+              onClick={() => void approveAllNftsToHelper()}
               disabled={!account || currentNftOperatorApproved || busy}
             >
               {approveAllButtonLabel}
@@ -2292,7 +2296,7 @@ export function App() {
           </div>
           <div className="row">
             <button
-              onClick={approveAllNftsToHelper}
+              onClick={() => void approveAllNftsToHelper()}
               disabled={!account || currentNftOperatorApproved || busy}
             >
               {approveAllButtonLabel}
