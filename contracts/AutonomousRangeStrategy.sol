@@ -144,6 +144,8 @@ contract AutonomousRangeStrategy is IERC721Receiver {
         _validateTicks(tickLower, tickUpper);
         if (mintLiquidity == 0) revert NothingToMint();
 
+        _sendIdleBalanceToExecutor(poolKey.currency0);
+        _sendIdleBalanceToExecutor(poolKey.currency1);
         positionManager.approve(address(executor), tokenId);
         uint256 oldTokenId = currentTokenId;
         uint256 newTokenId = executor.rebalance(
@@ -201,5 +203,10 @@ contract AutonomousRangeStrategy is IERC721Receiver {
         if (tickUpper <= tickLower) revert InvalidTicks();
         int24 width = tickUpper - tickLower;
         if (width > maxTickWidth) revert InvalidTicks();
+    }
+
+    function _sendIdleBalanceToExecutor(address token) internal {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        if (balance > 0) IERC20(token).transfer(address(executor), balance);
     }
 }
