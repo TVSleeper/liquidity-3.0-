@@ -288,6 +288,9 @@ export function App() {
   const [nftOperatorApprovals, setNftOperatorApprovals] = useState<Record<string, boolean>>({});
   const [status, setStatus] = useState("Готов к подключению MetaMask.");
   const [busy, setBusy] = useState(false);
+  const [liveRefreshCount, setLiveRefreshCount] = useState(0);
+  const [liveRefreshLastAt, setLiveRefreshLastAt] = useState("");
+  const [liveRefreshStatus, setLiveRefreshStatus] = useState("Ждёт подключение кошелька и пул.");
 
   const [mode, setMode] = useState<LiquidityMode>("both");
   const [offsetPercent, setOffsetPercent] = useState("0");
@@ -324,6 +327,9 @@ export function App() {
     positions.find((item) => item.tokenId.toString() === selectedPositionId) ??
     positions[0] ??
     null;
+  const liveRefreshLabel = pool && account
+    ? `1 сек • #${liveRefreshCount}`
+    : "Ждёт пул";
   const helperAddressValid = Boolean(helperAddress && isAddress(helperAddress));
   const normalizedHelperAddress = helperAddressValid ? getAddress(helperAddress) : null;
   const strategyAddressValid = Boolean(strategyAddress && isAddress(strategyAddress));
@@ -1621,6 +1627,63 @@ export function App() {
   }
 
   useEffect(() => {
+    if (!pool || !account) {
+      setLiveRefreshStatus("Ждёт подключение кошелька и пул.");
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+
+    const poll = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const activeTokenId = selectedPositionId
+          ? BigInt(selectedPositionId)
+          : currentPosition?.tokenId ?? null;
+        const [freshPool, freshPosition] = await Promise.all([
+          loadPoolState(client, pool.poolId, pool.poolKey, account),
+          activeTokenId
+            ? readPositionById({
+                client,
+                tokenId: activeTokenId,
+                owner: account,
+                poolId: pool.poolId
+              }).catch(() => null)
+            : Promise.resolve(null)
+        ]);
+        if (cancelled) return;
+        setPool(freshPool);
+        if (activeTokenId) {
+          setPositions((prev) => {
+            const next = prev.filter((position) => position.tokenId !== activeTokenId);
+            if (freshPosition) next.push(freshPosition);
+            return next.sort((a, b) => Number(a.tokenId - b.tokenId));
+          });
+          if (!freshPosition && selectedPositionId === activeTokenId.toString()) {
+            setSelectedPositionId("");
+          }
+        }
+        setLiveRefreshCount((value) => value + 1);
+        setLiveRefreshLastAt(new Date().toLocaleTimeString("ru-RU", { hour12: false }));
+        setLiveRefreshStatus("Работает.");
+      } catch (error) {
+        if (!cancelled) setLiveRefreshStatus(`Ошибка live refresh: ${compactErrorMessage(error)}`);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = window.setInterval(poll, 1_000);
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [account, client, currentPosition?.tokenId, pool?.poolId, selectedPositionId]);
+
+  useEffect(() => {
     if (!followWatching || !pool || !account || !walletClient || !currentPosition) return;
     const activeHelper =
       followRuntimeSettings?.helperAddress ??
@@ -1909,6 +1972,8 @@ export function App() {
               <span>
                 {pool.token1.symbol}: {formatTokenAmount(pool.token1.balance, pool.token1.decimals)}
               </span>
+              <span>Live: {liveRefreshLabel}</span>
+              <span>{liveRefreshLastAt ? `Последнее: ${liveRefreshLastAt}` : liveRefreshStatus}</span>
             </div>
           )}
         </div>
@@ -2209,6 +2274,8 @@ export function App() {
               <span>Pool: {pool.token0.symbol}/{pool.token1.symbol}</span>
               <span>Pool ID: {`${pool.poolId.slice(0, 10)}…${pool.poolId.slice(-6)}`}</span>
               <span>Price: {describePrice(pool)}</span>
+              <span>Live: {liveRefreshLabel}</span>
+              <span>{liveRefreshLastAt ? `Последнее: ${liveRefreshLastAt}` : liveRefreshStatus}</span>
             </div>
           )}
           <div className="row">
