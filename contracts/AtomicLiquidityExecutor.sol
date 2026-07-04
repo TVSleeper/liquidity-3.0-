@@ -108,12 +108,14 @@ contract AtomicLiquidityExecutor {
         _decreaseToThis(poolKey, tokenId, liquidityToRemove, amount0Min, amount1Min, deadline);
 
         if (swapAmountIn > 0) {
+            (uint128 actualSwapAmountIn, uint128 actualSwapAmountOutMin) =
+                _actualSwapAmounts(swapInput, swapAmountIn, swapAmountOutMin);
             _swapExactIn(
                 poolKey,
                 swapInput,
                 swapOutput,
-                swapAmountIn,
-                swapAmountOutMin,
+                actualSwapAmountIn,
+                actualSwapAmountOutMin,
                 address(this),
                 deadline
             );
@@ -206,6 +208,20 @@ contract AtomicLiquidityExecutor {
         bytes[] memory inputs = new bytes[](1);
         inputs[0] = abi.encode(actions, params);
         universalRouter.execute(abi.encodePacked(bytes1(uint8(INFI_SWAP))), inputs, deadline);
+    }
+
+    function _actualSwapAmounts(address input, uint128 plannedAmountIn, uint128 plannedAmountOutMin)
+        internal
+        view
+        returns (uint128 amountIn, uint128 amountOutMin)
+    {
+        uint256 balance = IERC20(input).balanceOf(address(this));
+        if (balance == 0) revert NothingToSwap();
+        amountIn = balance > type(uint128).max ? type(uint128).max : uint128(balance);
+        amountOutMin = plannedAmountOutMin;
+        if (amountIn < plannedAmountIn) {
+            amountOutMin = uint128((uint256(plannedAmountOutMin) * uint256(amountIn)) / uint256(plannedAmountIn));
+        }
     }
 
     function _approveForPositionManager(address token) internal {

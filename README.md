@@ -90,6 +90,7 @@ cp bot/env.example .env
 SIDE=below
 CHECK_SECONDS=1
 REBALANCE_ON_UNWANTED_ASSET=true
+MINT_SAFETY_PERCENT=98
 ```
 
 Если хотите, чтобы бот сам переключался между USDT ниже цены при падении и NES выше цены при росте:
