@@ -90,8 +90,10 @@ cp bot/env.example .env
 SIDE=below
 CHECK_SECONDS=1
 REBALANCE_ON_UNWANTED_ASSET=true
-MINT_SAFETY_PERCENT=98
+MINT_SAFETY_PERCENT=100
 ```
+
+Если на очень резком движении mint начинает падать из-за нехватки баланса в новом диапазоне, можно временно снизить `MINT_SAFETY_PERCENT` до `99` или `98`. Это не потеря средств: незалитый остаток остается на strategy-контракте и подхватывается следующим rebalance.
 
 Если хотите, чтобы бот сам переключался между USDT ниже цены при падении и NES выше цены при росте:
 
