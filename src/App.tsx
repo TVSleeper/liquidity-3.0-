@@ -2613,13 +2613,6 @@ export function App() {
             <label>
               Отступ от цены, %
               <input value={managedOffsetPercent} onChange={(event) => setManagedOffsetPercent(event.target.value)} />
-              <button
-                type="button"
-                className="field-action"
-                onClick={() => setManagedOffsetPercent("0")}
-              >
-                Максимально близко
-              </button>
             </label>
             <label>
               Сумма {managedPreview?.targetToken.symbol ?? (managedSide === "below" ? "USDT" : "NES")}
