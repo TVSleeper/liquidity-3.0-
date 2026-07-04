@@ -589,7 +589,15 @@ export function App() {
           ...positions.map((position) => position.tokenId.toString()),
           ...savedPositionIds
         ])
-      ].map((tokenId) => BigInt(tokenId));
+      ]
+        .map((tokenId) => {
+          try {
+            return BigInt(tokenId);
+          } catch {
+            return null;
+          }
+        })
+        .filter((tokenId): tokenId is bigint => tokenId !== null);
       const [nextPoolState, knownPositions, approval0, approval1] = await Promise.all([
         loadPoolState(nextClient, nextPool.poolId, nextPool.poolKey, owner),
         Promise.all(
@@ -599,7 +607,7 @@ export function App() {
               tokenId,
               owner,
               poolId: nextPool.poolId
-            })
+            }).catch(() => null)
           )
         ),
         readApprovalState({
