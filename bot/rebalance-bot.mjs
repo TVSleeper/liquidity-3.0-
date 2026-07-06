@@ -37,7 +37,11 @@ const checkSeconds = Math.max(1, envNumber("CHECK_SECONDS", 3));
 const slippageBps = Math.max(0, Math.floor(envNumber("SLIPPAGE_BPS", 50)));
 const mintSafetyPercent = Math.min(100, Math.max(1, envNumber("MINT_SAFETY_PERCENT", 100)));
 const mintMaxBufferBps = Math.max(0, Math.floor(envNumber("MINT_MAX_BUFFER_BPS", 5)));
-const postSwapMintBufferTicks = Math.max(0, Math.floor(envNumber("POST_SWAP_MINT_BUFFER_TICKS", 100)));
+const postSwapMintBufferTicks = Math.max(0, Math.floor(envNumber("POST_SWAP_MINT_BUFFER_TICKS", 0)));
+const postSwapRetryBufferTicks = Math.max(
+  postSwapMintBufferTicks,
+  Math.floor(envNumber("POST_SWAP_RETRY_BUFFER_TICKS", 100))
+);
 const rebalanceTickThreshold = Math.max(1, envNumber("REBALANCE_TICK_THRESHOLD", 0));
 const removeMinBps = Math.min(10_000, Math.max(0, Math.floor(envNumber("REMOVE_MIN_BPS", 0))));
 const rebalanceOnUnwantedAsset = envBoolean("REBALANCE_ON_UNWANTED_ASSET", true);
@@ -58,6 +62,7 @@ if (!["below", "above"].includes(autoInitialSide)) {
 const poolKey = await discoverPoolKey(publicClient, poolId);
 let lastObservedTick = null;
 let lastAutoSide = autoInitialSide;
+let activePostSwapMintBufferTicks = postSwapMintBufferTicks;
 
 console.log("Autonomous range bot started");
 console.log(`Keeper:   ${account.address}`);
@@ -74,7 +79,9 @@ console.log(
 );
 console.log(`Remove min: ${removeMinBps} bps of expected amounts`);
 console.log(`Mint max: +${mintMaxBufferBps} bps buffer`);
-console.log(`Post-swap mint buffer: ${postSwapMintBufferTicks} ticks`);
+console.log(
+  `Post-swap mint buffer: ${postSwapMintBufferTicks} ticks, retry ${postSwapRetryBufferTicks} ticks`
+);
 console.log(`Dry run:  ${dryRun ? "yes" : "no"}`);
 console.log("");
 
@@ -178,7 +185,7 @@ function alignTickBuffer(ticks, tickSpacing) {
 }
 
 function applyPostSwapMintBuffer(target, side, pool) {
-  const buffer = alignTickBuffer(postSwapMintBufferTicks, Math.max(1, pool.tickSpacing));
+  const buffer = alignTickBuffer(activePostSwapMintBufferTicks, Math.max(1, pool.tickSpacing));
   if (buffer === 0) return { target, buffer };
   const direction = side === "below" ? -1 : 1;
   return {
@@ -188,6 +195,11 @@ function applyPostSwapMintBuffer(target, side, pool) {
     },
     buffer
   };
+}
+
+function isMaximumAmountExceeded(error) {
+  const message = String(error?.message ?? error);
+  return message.includes("MaximumAmountExceeded") || message.includes("0x31e30ad0");
 }
 
 async function readStrategyTokenBalances(pool) {
@@ -437,8 +449,18 @@ async function tick() {
     console.log(`  tx ${hash}`);
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     console.log(`  confirmed block ${receipt.blockNumber.toString()} status ${receipt.status}`);
+    activePostSwapMintBufferTicks = postSwapMintBufferTicks;
   } catch (error) {
     console.error(`[${new Date().toISOString()}] ${error.message}`);
+    if (
+      isMaximumAmountExceeded(error) &&
+      postSwapRetryBufferTicks > activePostSwapMintBufferTicks
+    ) {
+      activePostSwapMintBufferTicks = postSwapRetryBufferTicks;
+      console.log(
+        `  next post-swap retry will use ${activePostSwapMintBufferTicks} ticks buffer`
+      );
+    }
   }
 }
 
