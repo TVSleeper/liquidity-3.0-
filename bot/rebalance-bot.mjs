@@ -37,6 +37,7 @@ const checkSeconds = Math.max(1, envNumber("CHECK_SECONDS", 3));
 const slippageBps = Math.max(0, Math.floor(envNumber("SLIPPAGE_BPS", 50)));
 const mintSafetyPercent = Math.min(100, Math.max(1, envNumber("MINT_SAFETY_PERCENT", 100)));
 const mintMaxBufferBps = Math.max(0, Math.floor(envNumber("MINT_MAX_BUFFER_BPS", 5)));
+const postSwapMintBufferTicks = Math.max(0, Math.floor(envNumber("POST_SWAP_MINT_BUFFER_TICKS", 100)));
 const rebalanceTickThreshold = Math.max(1, envNumber("REBALANCE_TICK_THRESHOLD", 0));
 const removeMinBps = Math.min(10_000, Math.max(0, Math.floor(envNumber("REMOVE_MIN_BPS", 0))));
 const rebalanceOnUnwantedAsset = envBoolean("REBALANCE_ON_UNWANTED_ASSET", true);
@@ -73,6 +74,7 @@ console.log(
 );
 console.log(`Remove min: ${removeMinBps} bps of expected amounts`);
 console.log(`Mint max: +${mintMaxBufferBps} bps buffer`);
+console.log(`Post-swap mint buffer: ${postSwapMintBufferTicks} ticks`);
 console.log(`Dry run:  ${dryRun ? "yes" : "no"}`);
 console.log("");
 
@@ -170,6 +172,24 @@ function expectedRemoveMin(amount) {
   return (amount * BigInt(removeMinBps)) / 10_000n;
 }
 
+function alignTickBuffer(ticks, tickSpacing) {
+  if (!ticks) return 0;
+  return Math.max(tickSpacing, Math.ceil(ticks / tickSpacing) * tickSpacing);
+}
+
+function applyPostSwapMintBuffer(target, side, pool) {
+  const buffer = alignTickBuffer(postSwapMintBufferTicks, Math.max(1, pool.tickSpacing));
+  if (buffer === 0) return { target, buffer };
+  const direction = side === "below" ? -1 : 1;
+  return {
+    target: {
+      tickLower: target.tickLower + direction * buffer,
+      tickUpper: target.tickUpper + direction * buffer
+    },
+    buffer
+  };
+}
+
 async function readStrategyTokenBalances(pool) {
   const [balance0, balance1] = await publicClient.multicall({
     allowFailure: true,
@@ -218,11 +238,12 @@ async function buildRebalance() {
     }
     throw error;
   }
-  const target = computeFollowRange(pool, activeSide, offsetPercent);
+  const baseTarget = computeFollowRange(pool, activeSide, offsetPercent);
+  let target = baseTarget;
   const threshold = rebalanceTickThreshold || Math.max(1, pool.tickSpacing);
   const drift = Math.max(
-    Math.abs(position.tickLower - target.tickLower),
-    Math.abs(position.tickUpper - target.tickUpper)
+    Math.abs(position.tickLower - baseTarget.tickLower),
+    Math.abs(position.tickUpper - baseTarget.tickUpper)
   );
 
   if (position.liquidity < minLiquidity) {
@@ -264,7 +285,7 @@ async function buildRebalance() {
   if (!hasRangeDrift && !hasUnwantedAsset) {
     return {
       shouldMove: false,
-      reason: `on target (${activeSide}): position ${position.tickLower}->${position.tickUpper}, target ${target.tickLower}->${target.tickUpper}, tick ${pool.tick}`
+      reason: `on target (${activeSide}): position ${position.tickLower}->${position.tickUpper}, target ${baseTarget.tickLower}->${baseTarget.tickUpper}, tick ${pool.tick}`
     };
   }
 
@@ -299,6 +320,16 @@ async function buildRebalance() {
     );
     amount1After = 0n;
     amount0After += swapAmountOutMin;
+  }
+
+  let appliedPostSwapBuffer = 0;
+  if (swapAmountIn > 0n) {
+    const buffered = applyPostSwapMintBuffer(baseTarget, activeSide, pool);
+    target = buffered.target;
+    appliedPostSwapBuffer = buffered.buffer;
+    if (appliedPostSwapBuffer > 0) {
+      triggers.push(`post-swap mint buffer ${appliedPostSwapBuffer} ticks`);
+    }
   }
 
   const mintLiquidity =
@@ -343,6 +374,8 @@ async function buildRebalance() {
     summary: {
       removed,
       idle,
+      baseTarget,
+      appliedPostSwapBuffer,
       swapInput,
       swapOutput,
       swapAmountIn,
