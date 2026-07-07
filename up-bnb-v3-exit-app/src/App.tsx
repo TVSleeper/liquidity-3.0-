@@ -516,6 +516,7 @@ export function App() {
         args: [
           PANCAKE_V3_ADDRESSES.nonfungiblePositionManager,
           PANCAKE_V3_ADDRESSES.swapRouter,
+          UP_BNB_V3_POOL.pool,
           UP_BNB_V3_POOL.upToken,
           PANCAKE_V3_ADDRESSES.wbnb
         ],
@@ -666,7 +667,7 @@ export function App() {
         if (nextPosition && nextPosition.liquidity > 0n) return [nextPosition, ...rest];
         return rest;
       });
-      setStatus(`Готово: liquidity снята. Если UP удалось продать через pool, он пришел как BNB; если swap был заблокирован, UP вернулся на кошелек. Tx: ${hash}`);
+      setStatus(`Готово: liquidity снята, UP продан напрямую через V3 pool, BNB отправлен на кошелек. Tx: ${hash}`);
     } catch (error) {
       setStatus(`Ошибка exit: ${compactErrorMessage(error)}`);
     } finally {
@@ -883,7 +884,7 @@ export function App() {
             onClick={() => void exitAndSell()}
             disabled={!account || !position || !isUpBnbPosition || !isOwner || liquidityToRemove <= 0n || busy}
           >
-            Снять и попробовать продать UP
+            Снять и продать UP за BNB
           </button>
           <button
             onClick={() => void exitWithoutSell()}

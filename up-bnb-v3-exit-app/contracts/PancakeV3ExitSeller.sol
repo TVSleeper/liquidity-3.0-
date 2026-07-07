@@ -76,13 +76,34 @@ interface IPancakeV3SwapRouter {
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
+interface IPancakeV3Pool {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function fee() external view returns (uint24);
+
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+}
+
 contract PancakeV3ExitSeller is IERC721Receiver {
+    uint160 private constant MIN_SQRT_RATIO_PLUS_ONE = 4295128740;
+    uint160 private constant MAX_SQRT_RATIO_MINUS_ONE = 1461446703485210103287273052203988822378723970341;
+
     IPancakeV3PositionManager public immutable positionManager;
     IPancakeV3SwapRouter public immutable swapRouter;
+    IPancakeV3Pool public immutable v3Pool;
     address public immutable upToken;
     address public immutable wbnb;
 
     error InvalidPosition();
+    error InvalidPool();
+    error InvalidSwapCallback();
+    error InsufficientOutput();
     error NotPositionOwner();
     error ZeroLiquidity();
     error NativeTransferFailed();
@@ -104,12 +125,16 @@ contract PancakeV3ExitSeller is IERC721Receiver {
         uint256 bnbOut
     );
 
-    constructor(address _positionManager, address _swapRouter, address _upToken, address _wbnb) {
-        if (_positionManager == address(0) || _swapRouter == address(0) || _upToken == address(0) || _wbnb == address(0)) {
+    constructor(address _positionManager, address _swapRouter, address _v3Pool, address _upToken, address _wbnb) {
+        if (
+            _positionManager == address(0) || _swapRouter == address(0) || _v3Pool == address(0)
+                || _upToken == address(0) || _wbnb == address(0)
+        ) {
             revert InvalidPosition();
         }
         positionManager = IPancakeV3PositionManager(_positionManager);
         swapRouter = IPancakeV3SwapRouter(_swapRouter);
+        v3Pool = IPancakeV3Pool(_v3Pool);
         upToken = _upToken;
         wbnb = _wbnb;
     }
@@ -154,6 +179,10 @@ contract PancakeV3ExitSeller is IERC721Receiver {
             positionManager.safeTransferFrom(address(this), msg.sender, tokenId);
             revert InvalidPosition();
         }
+        if (v3Pool.token0() != token0 || v3Pool.token1() != token1 || v3Pool.fee() != fee) {
+            positionManager.safeTransferFrom(address(this), msg.sender, tokenId);
+            revert InvalidPool();
+        }
 
         positionManager.decreaseLiquidity(
             IPancakeV3PositionManager.DecreaseLiquidityParams({
@@ -177,26 +206,8 @@ contract PancakeV3ExitSeller is IERC721Receiver {
         uint256 upBalance = IERC20Optional(upToken).balanceOf(address(this));
         uint256 upSold;
         if (trySellUp && upBalance > 0) {
-            _approve(upToken, address(swapRouter), 0);
-            _approve(upToken, address(swapRouter), upBalance);
-            try swapRouter.exactInputSingle(
-                IPancakeV3SwapRouter.ExactInputSingleParams({
-                    tokenIn: upToken,
-                    tokenOut: wbnb,
-                    fee: fee,
-                    recipient: address(this),
-                    deadline: deadline,
-                    amountIn: upBalance,
-                    amountOutMinimum: minBnbOut,
-                    sqrtPriceLimitX96: 0
-                })
-            ) returns (uint256 amountOut) {
-                upSold = upBalance;
-                amountOut;
-            } catch {
-                if (minBnbOut > 0) revert TokenCallFailed();
-                _approve(upToken, address(swapRouter), 0);
-            }
+            _swapUpForWbnb(token0, token1, upBalance, minBnbOut);
+            upSold = upBalance;
         }
 
         uint256 wbnbBalance = IERC20Optional(wbnb).balanceOf(address(this));
@@ -218,11 +229,45 @@ contract PancakeV3ExitSeller is IERC721Receiver {
         }
     }
 
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3SwapCallback(amount0Delta, amount1Delta, data);
+    }
+
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3SwapCallback(amount0Delta, amount1Delta, data);
+    }
+
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
         return IERC721Receiver.onERC721Received.selector;
     }
 
     receive() external payable {}
+
+    function _swapUpForWbnb(address token0, address token1, uint256 upAmountIn, uint256 minBnbOut) internal {
+        if (upAmountIn > uint256(type(int256).max)) revert TokenCallFailed();
+
+        bool zeroForOne = token0 == upToken;
+        uint256 beforeWbnb = IERC20Optional(wbnb).balanceOf(address(this));
+        v3Pool.swap(
+            address(this),
+            zeroForOne,
+            int256(upAmountIn),
+            zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE,
+            abi.encode(token0, token1)
+        );
+        uint256 amountOut = IERC20Optional(wbnb).balanceOf(address(this)) - beforeWbnb;
+        if (amountOut < minBnbOut) revert InsufficientOutput();
+    }
+
+    function _v3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) internal {
+        if (msg.sender != address(v3Pool)) revert InvalidSwapCallback();
+        (address token0, address token1) = abi.decode(data, (address, address));
+        if (!((token0 == upToken && token1 == wbnb) || (token0 == wbnb && token1 == upToken))) {
+            revert InvalidPool();
+        }
+        if (amount0Delta > 0) _transferToken(token0, msg.sender, uint256(amount0Delta));
+        if (amount1Delta > 0) _transferToken(token1, msg.sender, uint256(amount1Delta));
+    }
 
     function _approve(address token, address spender, uint256 amount) internal {
         (bool success, bytes memory data) =
@@ -233,8 +278,12 @@ contract PancakeV3ExitSeller is IERC721Receiver {
     function _sweep(address token, address recipient) internal {
         uint256 balance = IERC20Optional(token).balanceOf(address(this));
         if (balance == 0) return;
+        _transferToken(token, recipient, balance);
+    }
+
+    function _transferToken(address token, address recipient, uint256 amount) internal {
         (bool success, bytes memory data) =
-            token.call(abi.encodeWithSelector(bytes4(keccak256("transfer(address,uint256)")), recipient, balance));
+            token.call(abi.encodeWithSelector(bytes4(keccak256("transfer(address,uint256)")), recipient, amount));
         if (!success || (data.length > 0 && !abi.decode(data, (bool)))) revert TokenCallFailed();
     }
 
