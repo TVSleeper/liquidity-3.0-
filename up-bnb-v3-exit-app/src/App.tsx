@@ -148,6 +148,10 @@ function statusClass(message: string) {
   return "status";
 }
 
+function looksLikeRawSwapRevert(message: string) {
+  return message.includes("execution reverted: 0x") || message.includes("reverted with the following reason: 0x");
+}
+
 export function App() {
   const [account, setAccount] = useState<Address | null>(null);
   const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
@@ -429,6 +433,39 @@ export function App() {
     }
   }
 
+  async function findExecutableExitPercent(args: {
+    helper: Address;
+    tokenId: bigint;
+    liquidity: bigint;
+    requestedPercent: number;
+    minBnbOut: bigint;
+    deadline: bigint;
+  }) {
+    if (!account) return null;
+    const candidates = [75, 50, 25, 10, 5, 2, 1, 0.5, 0.1].filter(
+      (percent) => percent < args.requestedPercent
+    );
+
+    for (const percent of candidates) {
+      const liquidity = pctToLiquidity(args.liquidity, String(percent));
+      if (liquidity <= 0n) continue;
+      try {
+        await client.simulateContract({
+          address: args.helper,
+          abi: pancakeV3ExitSellerCompiledAbi,
+          functionName: "exitSellUpForBnb",
+          args: [args.tokenId, liquidity, 0n, 0n, args.minBnbOut, args.deadline],
+          account
+        });
+        return percent;
+      } catch {
+        // Try a smaller slice.
+      }
+    }
+
+    return null;
+  }
+
   async function loadPosition() {
     if (!tokenIdValue) {
       setStatus("Ошибка: укажите числовой V3 NFT tokenId.");
@@ -582,7 +619,33 @@ export function App() {
           account
         });
       } catch (error) {
-        throw new Error(`Предварительная проверка показала revert: ${compactErrorMessage(error)}`);
+        const message = compactErrorMessage(error);
+        const requestedPercent = Math.min(100, Math.max(0, normalizePercent(exitPercent, 100)));
+        const suggestedPercent = looksLikeRawSwapRevert(message)
+          ? await findExecutableExitPercent({
+              helper,
+              tokenId: tokenIdValue,
+              liquidity: updatedPosition.liquidity,
+              requestedPercent,
+              minBnbOut: minimumBnb,
+              deadline
+            })
+          : null;
+
+        if (suggestedPercent !== null) {
+          setExitPercent(String(suggestedPercent));
+          throw new Error(
+            `В этом V3-пуле сейчас не получается продать ${requestedPercent}% UP за один раз. Я поставил рабочий Exit % = ${suggestedPercent}. Нажмите "Снять и продать UP за BNB" ещё раз.`
+          );
+        }
+
+        if (looksLikeRawSwapRevert(message)) {
+          throw new Error(
+            "Этот V3-пул сейчас не может принять продажу выбранного объёма UP через тот же pool. Попробуйте вручную поставить меньший Exit %, например 10 или 1."
+          );
+        }
+
+        throw new Error(`Предварительная проверка показала revert: ${message}`);
       }
 
       setStatus("Подтвердите снятие liquidity и продажу UP за BNB...");
