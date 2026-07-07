@@ -1,4 +1,4 @@
-import { parseAbi } from "viem";
+import { parseAbi, parseAbiItem } from "viem";
 
 export const erc20Abi = parseAbi([
   "function symbol() view returns (string)",
@@ -19,3 +19,5 @@ export const pancakeV3PoolAbi = parseAbi([
   "function token1() view returns (address)",
   "function fee() view returns (uint24)"
 ]);
+
+export const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");

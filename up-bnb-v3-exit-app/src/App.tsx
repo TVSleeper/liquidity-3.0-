@@ -15,7 +15,7 @@ import {
 } from "viem";
 import { bsc } from "viem/chains";
 import { pancakeV3ExitSellerBytecode, pancakeV3ExitSellerCompiledAbi } from "./generated/PancakeV3ExitSeller";
-import { erc20Abi, pancakeV3PoolAbi, pancakeV3PositionManagerAbi } from "./lib/abis";
+import { erc20Abi, pancakeV3PoolAbi, pancakeV3PositionManagerAbi, transferEvent } from "./lib/abis";
 import {
   BSC_CHAIN_ID,
   BSC_RPC_URL,
@@ -25,6 +25,9 @@ import {
   ZERO_ADDRESS
 } from "./lib/constants";
 import { deployWithWallet, writeWithWallet } from "./lib/wallet";
+
+const DEFAULT_SCAN_LOOKBACK_BLOCKS = 300_000n;
+const LOG_SCAN_CHUNK_SIZE = 40_000n;
 
 type TokenMeta = {
   address: Address;
@@ -129,6 +132,12 @@ function parseAmount(value: string, decimals: number): bigint {
   return parseUnits(clean, decimals);
 }
 
+function parseBlockNumber(value: string): bigint | null {
+  const clean = value.trim().replaceAll("_", "");
+  if (!clean || !/^\d+$/.test(clean)) return null;
+  return BigInt(clean);
+}
+
 function formatTokenAmount(value: bigint, decimals: number, digits = 4) {
   const raw = formatUnits(value, decimals);
   const num = Number(raw);
@@ -153,10 +162,12 @@ export function App() {
   const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
   const [helperAddress, setHelperAddress] = useStoredState("upBnbV3ExitHelperAddress", "");
   const [tokenId, setTokenId] = useStoredState("upBnbV3ExitTokenId", "");
+  const [scanFromBlock, setScanFromBlock] = useStoredState("upBnbV3ScanFromBlock", "");
   const [exitPercent, setExitPercent] = useState("100");
   const [minBnbOut, setMinBnbOut] = useState("0");
   const [poolInfo, setPoolInfo] = useState<V3PoolInfo | null>(null);
   const [position, setPosition] = useState<V3PositionInfo | null>(null);
+  const [positions, setPositions] = useState<V3PositionInfo[]>([]);
   const [status, setStatus] = useState("Готов к подключению MetaMask.");
   const [busy, setBusy] = useState(false);
 
@@ -232,9 +243,11 @@ export function App() {
       const [connected] = await wc.requestAddresses();
       const chainId = await wc.getChainId();
       if (chainId !== BSC_CHAIN_ID) throw new Error("MetaMask должен быть в BNB Smart Chain.");
-      setAccount(getAddress(connected));
+      const nextAccount = getAddress(connected);
+      setAccount(nextAccount);
       setWalletClient(wc);
       setStatus("Кошелек подключен.");
+      void scanOwnedPositions(nextAccount, false);
     } catch (error) {
       setStatus(`Ошибка подключения: ${compactErrorMessage(error)}`);
     } finally {
@@ -353,6 +366,95 @@ export function App() {
     };
   }
 
+  function isUpBnbV3Position(nextPosition: V3PositionInfo) {
+    return (
+      (sameAddress(nextPosition.token0, UP_BNB_V3_POOL.upToken) &&
+        sameAddress(nextPosition.token1, PANCAKE_V3_ADDRESSES.wbnb)) ||
+      (sameAddress(nextPosition.token0, PANCAKE_V3_ADDRESSES.wbnb) &&
+        sameAddress(nextPosition.token1, UP_BNB_V3_POOL.upToken))
+    );
+  }
+
+  async function scanOwnedPositions(ownerOverride?: Address, showDone = true) {
+    const owner = ownerOverride ?? account;
+    if (!owner) {
+      setStatus("Ошибка поиска: сначала подключите MetaMask.");
+      return;
+    }
+
+    try {
+      setBusy(true);
+      setStatus("Ищу открытые UP/BNB V3 позиции кошелька...");
+      const latestBlock = await client.getBlockNumber();
+      const manualFromBlock = parseBlockNumber(scanFromBlock);
+      const fromBlock =
+        manualFromBlock ??
+        (latestBlock > DEFAULT_SCAN_LOOKBACK_BLOCKS ? latestBlock - DEFAULT_SCAN_LOOKBACK_BLOCKS : 0n);
+      const tokenIds = new Set<string>();
+
+      for (let start = fromBlock; start <= latestBlock; start += LOG_SCAN_CHUNK_SIZE + 1n) {
+        const end = start + LOG_SCAN_CHUNK_SIZE > latestBlock ? latestBlock : start + LOG_SCAN_CHUNK_SIZE;
+        setStatus(`Сканирую V3 NFT Transfer-логи: ${start.toString()} -> ${end.toString()}...`);
+        const [incoming, outgoing] = await Promise.all([
+          client.getLogs({
+            address: PANCAKE_V3_ADDRESSES.nonfungiblePositionManager,
+            event: transferEvent,
+            args: { to: owner },
+            fromBlock: start,
+            toBlock: end
+          }),
+          client.getLogs({
+            address: PANCAKE_V3_ADDRESSES.nonfungiblePositionManager,
+            event: transferEvent,
+            args: { from: owner },
+            fromBlock: start,
+            toBlock: end
+          })
+        ]);
+
+        for (const log of [...incoming, ...outgoing]) {
+          const id = log.args.tokenId;
+          if (id !== undefined) tokenIds.add(id.toString());
+        }
+      }
+
+      const candidates = [...tokenIds].map((id) => BigInt(id)).sort((a, b) => Number(b - a));
+      const found: V3PositionInfo[] = [];
+
+      for (const candidate of candidates) {
+        const nextPosition = await readPosition(candidate).catch(() => null);
+        if (!nextPosition) continue;
+        if (!sameAddress(nextPosition.owner, owner)) continue;
+        if (!isUpBnbV3Position(nextPosition)) continue;
+        if (nextPosition.liquidity <= 0n) continue;
+        found.push(nextPosition);
+      }
+
+      found.sort((a, b) => Number(b.tokenId - a.tokenId));
+      setPositions(found);
+
+      if (found[0]) {
+        setTokenId(found[0].tokenId.toString());
+        setPosition(found[0]);
+        if (!poolInfo) setPoolInfo(await readPoolInfo());
+        setStatus(
+          showDone
+            ? `Готово: найдено ${found.length} открытых UP/BNB V3 позиций. Выбрана #${found[0].tokenId.toString()}.`
+            : `Кошелек подключен. Найдено ${found.length} UP/BNB V3 позиций.`
+        );
+      } else {
+        setPosition(null);
+        setStatus(
+          `Открытые UP/BNB V3 позиции не найдены с блока ${fromBlock.toString()}. Если позиция старая, укажите более ранний Scan from block.`
+        );
+      }
+    } catch (error) {
+      setStatus(`Ошибка поиска позиций: ${compactErrorMessage(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function loadPosition() {
     if (!tokenIdValue) {
       setStatus("Ошибка: укажите числовой V3 NFT tokenId.");
@@ -364,6 +466,10 @@ export function App() {
       const [nextPoolInfo, nextPosition] = await Promise.all([readPoolInfo(), readPosition(tokenIdValue)]);
       setPoolInfo(nextPoolInfo);
       setPosition(nextPosition);
+      setPositions((prev) => {
+        const rest = prev.filter((item) => item.tokenId !== nextPosition.tokenId);
+        return [nextPosition, ...rest].sort((a, b) => Number(b.tokenId - a.tokenId));
+      });
       const valid =
         (sameAddress(nextPosition.token0, UP_BNB_V3_POOL.upToken) &&
           sameAddress(nextPosition.token1, PANCAKE_V3_ADDRESSES.wbnb)) ||
@@ -441,7 +547,9 @@ export function App() {
       });
       const receipt = await client.waitForTransactionReceipt({ hash });
       assertSuccessfulReceipt(receipt, hash, "Approve V3 NFT");
-      setPosition(await readPosition(activeTokenId, helper));
+      const updated = await readPosition(activeTokenId, helper);
+      setPosition(updated);
+      setPositions((prev) => prev.map((item) => (item.tokenId === updated.tokenId ? updated : item)));
       setStatus("Готово: V3 NFT разрешена для helper.");
       return true;
     } catch (error) {
@@ -514,7 +622,13 @@ export function App() {
       setStatus(`Транзакция отправлена: ${hash}. Жду подтверждение...`);
       const receipt = await client.waitForTransactionReceipt({ hash });
       assertSuccessfulReceipt(receipt, hash, "UP/BNB V3 exit + sell");
-      setPosition(await readPosition(tokenIdValue, helper).catch(() => null));
+      const nextPosition = await readPosition(tokenIdValue, helper).catch(() => null);
+      setPosition(nextPosition);
+      setPositions((prev) => {
+        const rest = prev.filter((item) => item.tokenId !== tokenIdValue);
+        if (nextPosition && nextPosition.liquidity > 0n) return [nextPosition, ...rest];
+        return rest;
+      });
       setStatus(`Готово: liquidity снята, UP продан за BNB. Tx: ${hash}`);
     } catch (error) {
       setStatus(`Ошибка exit: ${compactErrorMessage(error)}`);
@@ -577,9 +691,50 @@ export function App() {
           </button>
         </div>
 
+        <div className="row">
+          <label>
+            Найденные открытые позиции
+            <select
+              value={tokenId}
+              onChange={(event) => {
+                const nextTokenId = event.target.value;
+                setTokenId(nextTokenId);
+                const selected = positions.find((item) => item.tokenId.toString() === nextTokenId) ?? null;
+                setPosition(selected);
+              }}
+            >
+              <option value="">
+                {positions.length > 0 ? "Выберите позицию" : "Позиции ещё не найдены"}
+              </option>
+              {positions.map((item) => (
+                <option key={item.tokenId.toString()} value={item.tokenId.toString()}>
+                  #{item.tokenId.toString()} - liquidity {item.liquidity.toString()}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button onClick={() => void scanOwnedPositions()} disabled={!account || busy}>
+            Найти позиции
+          </button>
+        </div>
+
+        <div className="row">
+          <label>
+            Scan from block
+            <input
+              value={scanFromBlock}
+              onChange={(event) => setScanFromBlock(event.target.value)}
+              placeholder="Пусто = последние 300000 блоков"
+            />
+          </label>
+          <button onClick={() => setScanFromBlock("")} disabled={busy || !scanFromBlock}>
+            Сбросить
+          </button>
+        </div>
+
         <div className="grid four">
           <label>
-            V3 NFT tokenId
+            V3 NFT tokenId вручную
             <input value={tokenId} onChange={(event) => setTokenId(event.target.value)} placeholder="Например 12345" />
           </label>
           <label>

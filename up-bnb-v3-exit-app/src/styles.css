@@ -20,7 +20,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -54,7 +55,8 @@ button.wallet {
   box-shadow: 0 12px 28px rgba(18, 205, 218, 0.22);
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 48px;
   border: 1px solid #473a61;
@@ -65,7 +67,8 @@ input {
   outline: none;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: #23dce8;
   box-shadow: 0 0 0 2px rgba(35, 220, 232, 0.18);
 }
