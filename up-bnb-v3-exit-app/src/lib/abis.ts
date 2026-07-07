@@ -1,4 +1,4 @@
-import { parseAbi, parseAbiItem } from "viem";
+import { parseAbi } from "viem";
 
 export const erc20Abi = parseAbi([
   "function symbol() view returns (string)",
@@ -7,6 +7,8 @@ export const erc20Abi = parseAbi([
 ]);
 
 export const pancakeV3PositionManagerAbi = parseAbi([
+  "function balanceOf(address owner) view returns (uint256)",
+  "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
   "function ownerOf(uint256 tokenId) view returns (address)",
   "function approve(address spender, uint256 tokenId)",
   "function getApproved(uint256 tokenId) view returns (address)",
@@ -19,5 +21,3 @@ export const pancakeV3PoolAbi = parseAbi([
   "function token1() view returns (address)",
   "function fee() view returns (uint24)"
 ]);
-
-export const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");
