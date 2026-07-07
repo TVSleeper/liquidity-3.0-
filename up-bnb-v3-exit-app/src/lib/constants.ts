@@ -12,6 +12,6 @@ export const PANCAKE_V3_ADDRESSES = {
 } as const satisfies Record<string, Address>;
 
 export const UP_BNB_V3_POOL = {
-  pool: "0x57cF8c65Fd1e2B44Ea9E8F8eA0784ac6d0b60624",
+  pool: "0x57cf8c65fd1e2b44ea9e8f8ea0784ac6d0b60624",
   upToken: "0x000008d2175f9aeaddb2430c26f8a6f73c5a0000"
 } as const satisfies Record<string, Address>;
