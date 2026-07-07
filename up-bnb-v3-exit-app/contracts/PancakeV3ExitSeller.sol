@@ -96,6 +96,14 @@ contract PancakeV3ExitSeller is IERC721Receiver {
         uint256 bnbOut
     );
 
+    event ExitOnly(
+        address indexed owner,
+        uint256 indexed tokenId,
+        uint128 liquidityRemoved,
+        uint256 upOut,
+        uint256 bnbOut
+    );
+
     constructor(address _positionManager, address _swapRouter, address _upToken, address _wbnb) {
         if (_positionManager == address(0) || _swapRouter == address(0) || _upToken == address(0) || _wbnb == address(0)) {
             revert InvalidPosition();
@@ -114,6 +122,28 @@ contract PancakeV3ExitSeller is IERC721Receiver {
         uint256 minBnbOut,
         uint256 deadline
     ) external returns (uint256 bnbOut) {
+        (, bnbOut) = _exit(tokenId, liquidityToRemove, amount0Min, amount1Min, minBnbOut, deadline, true);
+    }
+
+    function exitOnly(
+        uint256 tokenId,
+        uint128 liquidityToRemove,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        uint256 deadline
+    ) external returns (uint256 upOut, uint256 bnbOut) {
+        (upOut, bnbOut) = _exit(tokenId, liquidityToRemove, amount0Min, amount1Min, 0, deadline, false);
+    }
+
+    function _exit(
+        uint256 tokenId,
+        uint128 liquidityToRemove,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        uint256 minBnbOut,
+        uint256 deadline,
+        bool trySellUp
+    ) internal returns (uint256 upOut, uint256 bnbOut) {
         if (positionManager.ownerOf(tokenId) != msg.sender) revert NotPositionOwner();
         if (liquidityToRemove == 0) revert ZeroLiquidity();
 
@@ -145,10 +175,11 @@ contract PancakeV3ExitSeller is IERC721Receiver {
         );
 
         uint256 upBalance = IERC20Optional(upToken).balanceOf(address(this));
-        if (upBalance > 0) {
+        uint256 upSold;
+        if (trySellUp && upBalance > 0) {
             _approve(upToken, address(swapRouter), 0);
             _approve(upToken, address(swapRouter), upBalance);
-            swapRouter.exactInputSingle(
+            try swapRouter.exactInputSingle(
                 IPancakeV3SwapRouter.ExactInputSingleParams({
                     tokenIn: upToken,
                     tokenOut: wbnb,
@@ -159,7 +190,13 @@ contract PancakeV3ExitSeller is IERC721Receiver {
                     amountOutMinimum: minBnbOut,
                     sqrtPriceLimitX96: 0
                 })
-            );
+            ) returns (uint256 amountOut) {
+                upSold = upBalance;
+                amountOut;
+            } catch {
+                if (minBnbOut > 0) revert TokenCallFailed();
+                _approve(upToken, address(swapRouter), 0);
+            }
         }
 
         uint256 wbnbBalance = IERC20Optional(wbnb).balanceOf(address(this));
@@ -169,11 +206,16 @@ contract PancakeV3ExitSeller is IERC721Receiver {
             bnbOut = wbnbBalance;
         }
 
+        upOut = IERC20Optional(upToken).balanceOf(address(this));
         _sweep(upToken, msg.sender);
         _sweep(wbnb, msg.sender);
         positionManager.safeTransferFrom(address(this), msg.sender, tokenId);
 
-        emit ExitSold(msg.sender, tokenId, liquidityToRemove, upBalance, bnbOut);
+        if (trySellUp) {
+            emit ExitSold(msg.sender, tokenId, liquidityToRemove, upSold, bnbOut);
+        } else {
+            emit ExitOnly(msg.sender, tokenId, liquidityToRemove, upBalance, bnbOut);
+        }
     }
 
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

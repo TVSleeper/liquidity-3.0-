@@ -666,9 +666,80 @@ export function App() {
         if (nextPosition && nextPosition.liquidity > 0n) return [nextPosition, ...rest];
         return rest;
       });
-      setStatus(`Готово: liquidity снята, UP продан за BNB. Tx: ${hash}`);
+      setStatus(`Готово: liquidity снята. Если UP удалось продать через pool, он пришел как BNB; если swap был заблокирован, UP вернулся на кошелек. Tx: ${hash}`);
     } catch (error) {
       setStatus(`Ошибка exit: ${compactErrorMessage(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exitWithoutSell() {
+    if (!walletClient || !account) {
+      setStatus("Ошибка exit: сначала подключите MetaMask.");
+      return;
+    }
+    const helper = normalizedHelperAddress ?? (await deployHelper());
+    if (!helper || !tokenIdValue) {
+      setStatus("Ошибка exit: укажите helper и V3 NFT tokenId.");
+      return;
+    }
+
+    try {
+      setStatus("Обновляю позицию перед снятием...");
+      const freshPosition = await readPosition(tokenIdValue, helper);
+      setPosition(freshPosition);
+      if (!sameAddress(freshPosition.owner, account)) {
+        throw new Error(`NFT принадлежит ${shortAddress(freshPosition.owner)}, а не подключенному кошельку.`);
+      }
+      if (!isUpBnbV3Position(freshPosition)) throw new Error("Эта NFT не относится к UP/BNB V3 pool.");
+
+      if (!freshPosition.approved && !freshPosition.approvedForAll) {
+        const approved = await approveNft(helper, tokenIdValue);
+        if (!approved) throw new Error("NFT approve не подтвержден.");
+      }
+
+      const updatedPosition = await readPosition(tokenIdValue, helper);
+      const activeLiquidity = pctToLiquidity(updatedPosition.liquidity, exitPercent);
+      if (activeLiquidity <= 0n) throw new Error("В выбранном проценте нет liquidity для снятия.");
+      const deadline = deadlineFromNow(DEADLINE_SECONDS);
+      const args = [tokenIdValue, activeLiquidity, 0n, 0n, deadline] as const;
+
+      setBusy(true);
+      setStatus("Проверяю снятие без продажи перед MetaMask...");
+      try {
+        await client.simulateContract({
+          address: helper,
+          abi: pancakeV3ExitSellerCompiledAbi,
+          functionName: "exitOnly",
+          args,
+          account
+        });
+      } catch (error) {
+        throw new Error(`Предварительная проверка показала revert: ${compactErrorMessage(error)}`);
+      }
+
+      setStatus("Подтвердите снятие liquidity без продажи...");
+      const hash = await writeWithWallet(walletClient, {
+        address: helper,
+        abi: pancakeV3ExitSellerCompiledAbi,
+        functionName: "exitOnly",
+        args,
+        account
+      });
+      setStatus(`Транзакция отправлена: ${hash}. Жду подтверждение...`);
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      assertSuccessfulReceipt(receipt, hash, "UP/BNB V3 exit only");
+      const nextPosition = await readPosition(tokenIdValue, helper).catch(() => null);
+      setPosition(nextPosition);
+      setPositions((prev) => {
+        const rest = prev.filter((item) => item.tokenId !== tokenIdValue);
+        if (nextPosition && nextPosition.liquidity > 0n) return [nextPosition, ...rest];
+        return rest;
+      });
+      setStatus(`Готово: liquidity снята без продажи, токены отправлены на кошелек. Tx: ${hash}`);
+    } catch (error) {
+      setStatus(`Ошибка снятия: ${compactErrorMessage(error)}`);
     } finally {
       setBusy(false);
     }
@@ -812,7 +883,13 @@ export function App() {
             onClick={() => void exitAndSell()}
             disabled={!account || !position || !isUpBnbPosition || !isOwner || liquidityToRemove <= 0n || busy}
           >
-            Снять и продать UP за BNB
+            Снять и попробовать продать UP
+          </button>
+          <button
+            onClick={() => void exitWithoutSell()}
+            disabled={!account || !position || !isUpBnbPosition || !isOwner || liquidityToRemove <= 0n || busy}
+          >
+            Снять без продажи
           </button>
         </div>
       </section>
