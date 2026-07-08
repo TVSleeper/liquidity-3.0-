@@ -1,9 +1,10 @@
-import { CheckCircle2, Loader2, RefreshCcw, ShieldCheck, Wallet } from "lucide-react";
-import { useMemo, useState } from "react";
+import { CheckCircle2, Loader2, Plus, RefreshCcw, ShieldCheck, Wallet } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import {
   createPublicClient,
   createWalletClient,
   custom,
+  encodeFunctionData,
   formatUnits,
   getAddress,
   http,
@@ -24,6 +25,17 @@ import {
   UP_BNB_V3_POOL,
   ZERO_ADDRESS
 } from "./lib/constants";
+import {
+  applySlippageDown,
+  ceilUsableTick,
+  floorUsableTick,
+  getAmountsForLiquidity,
+  getLiquidityForAmounts,
+  getSqrtRatioAtTick,
+  offsetPercentToTicks,
+  priceAtTick,
+  sqrtPriceX96ToHumanPrice
+} from "./lib/math";
 import { deployWithWallet, writeWithWallet } from "./lib/wallet";
 
 type TokenMeta = {
@@ -36,6 +48,10 @@ type V3PoolInfo = {
   token0: TokenMeta;
   token1: TokenMeta;
   fee: number;
+  tickSpacing: number;
+  currentTick: number;
+  sqrtPriceX96: bigint;
+  liquidity: bigint;
 };
 
 type V3PositionInfo = {
@@ -52,6 +68,11 @@ type V3PositionInfo = {
   approved: boolean;
   approvedForAll: boolean;
 };
+
+type AddLiquidityMode = "new" | "increase";
+type DepositMode = "bnb" | "up" | "both";
+
+const MAX_UINT256 = (1n << 256n) - 1n;
 
 function assertSuccessfulReceipt(
   receipt: { status?: "success" | "reverted"; transactionHash?: Hex },
@@ -138,6 +159,89 @@ function formatTokenAmount(value: bigint, decimals: number, digits = 4) {
   });
 }
 
+function formatNumber(value: number, digits = 8) {
+  if (!Number.isFinite(value)) return "-";
+  return value.toLocaleString("en-US", {
+    maximumFractionDigits: digits,
+    useGrouping: false
+  });
+}
+
+function parseBps(value: string, fallback: number) {
+  const parsed = Number(value.replace(",", "."));
+  return Number.isFinite(parsed) ? Math.min(5_000, Math.max(0, Math.round(parsed))) : fallback;
+}
+
+function rangeWidthTicks(poolInfo: V3PoolInfo, rangePercentText: string) {
+  const percent = Math.max(0, normalizePercent(rangePercentText, 0.01));
+  const rawTicks = Math.max(poolInfo.tickSpacing, Math.abs(offsetPercentToTicks(percent)));
+  return Math.max(poolInfo.tickSpacing, Math.ceil(rawTicks / poolInfo.tickSpacing) * poolInfo.tickSpacing);
+}
+
+function buildRange(poolInfo: V3PoolInfo, depositMode: DepositMode, rangePercentText: string) {
+  const width = rangeWidthTicks(poolInfo, rangePercentText);
+  if (depositMode === "bnb") {
+    const tickUpper = floorUsableTick(poolInfo.currentTick, poolInfo.tickSpacing);
+    return { tickLower: tickUpper - width, tickUpper };
+  }
+  if (depositMode === "up") {
+    const tickLower = ceilUsableTick(poolInfo.currentTick + 1, poolInfo.tickSpacing);
+    return { tickLower, tickUpper: tickLower + width };
+  }
+  const tickLower = floorUsableTick(poolInfo.currentTick, poolInfo.tickSpacing);
+  return { tickLower, tickUpper: tickLower + width };
+}
+
+function calculateAddAmounts(args: {
+  poolInfo: V3PoolInfo;
+  range: { tickLower: number; tickUpper: number };
+  depositMode: DepositMode;
+  upAmount: string;
+  bnbAmount: string;
+  upDecimals: number;
+  slippageBps: string;
+}) {
+  const parsedUp = args.depositMode === "bnb" ? 0n : parseAmount(args.upAmount, args.upDecimals);
+  const parsedBnb = args.depositMode === "up" ? 0n : parseAmount(args.bnbAmount, 18);
+  const amount0Desired = sameAddress(args.poolInfo.token0.address, UP_BNB_V3_POOL.upToken) ? parsedUp : parsedBnb;
+  const amount1Desired = sameAddress(args.poolInfo.token1.address, UP_BNB_V3_POOL.upToken) ? parsedUp : parsedBnb;
+  const sqrtLower = getSqrtRatioAtTick(args.range.tickLower);
+  const sqrtUpper = getSqrtRatioAtTick(args.range.tickUpper);
+  const liquidity = getLiquidityForAmounts(
+    args.poolInfo.sqrtPriceX96,
+    sqrtLower,
+    sqrtUpper,
+    amount0Desired,
+    amount1Desired
+  );
+  const expected = getAmountsForLiquidity(args.poolInfo.sqrtPriceX96, sqrtLower, sqrtUpper, liquidity);
+  const slippage = parseBps(args.slippageBps, 100);
+  return {
+    parsedUp,
+    parsedBnb,
+    amount0Desired,
+    amount1Desired,
+    amount0Min: applySlippageDown(expected.amount0, slippage),
+    amount1Min: applySlippageDown(expected.amount1, slippage),
+    expected,
+    liquidity
+  };
+}
+
+function priceWbnbPerUpAtTick(tick: number, poolInfo: V3PoolInfo) {
+  const raw = priceAtTick(tick, poolInfo.token0.decimals, poolInfo.token1.decimals);
+  return sameAddress(poolInfo.token0.address, UP_BNB_V3_POOL.upToken) ? raw : 1 / raw;
+}
+
+function currentPriceWbnbPerUp(poolInfo: V3PoolInfo) {
+  const raw = sqrtPriceX96ToHumanPrice(
+    poolInfo.sqrtPriceX96,
+    poolInfo.token0.decimals,
+    poolInfo.token1.decimals
+  );
+  return sameAddress(poolInfo.token0.address, UP_BNB_V3_POOL.upToken) ? raw : 1 / raw;
+}
+
 function deadlineFromNow(seconds: number) {
   return BigInt(Math.floor(Date.now() / 1000) + seconds);
 }
@@ -159,6 +263,13 @@ export function App() {
   const [tokenId, setTokenId] = useStoredState("upBnbV3ExitTokenId", "");
   const [exitPercent, setExitPercent] = useState("100");
   const [minBnbOut, setMinBnbOut] = useState("0");
+  const [addMode, setAddMode] = useState<AddLiquidityMode>("new");
+  const [depositMode, setDepositMode] = useState<DepositMode>("bnb");
+  const [rangePercent, setRangePercent] = useState("0.01");
+  const [upAmount, setUpAmount] = useState("");
+  const [bnbAmount, setBnbAmount] = useState("");
+  const [addSlippageBps, setAddSlippageBps] = useState("100");
+  const [upAllowance, setUpAllowance] = useState(0n);
   const [poolInfo, setPoolInfo] = useState<V3PoolInfo | null>(null);
   const [position, setPosition] = useState<V3PositionInfo | null>(null);
   const [positions, setPositions] = useState<V3PositionInfo[]>([]);
@@ -173,6 +284,18 @@ export function App() {
       }),
     []
   );
+
+  useEffect(() => {
+    let mounted = true;
+    readPoolInfo()
+      .then((nextPoolInfo) => {
+        if (mounted) setPoolInfo(nextPoolInfo);
+      })
+      .catch(() => null);
+    return () => {
+      mounted = false;
+    };
+  }, [client]);
 
   const normalizedHelperAddress = helperAddress && isAddress(helperAddress) ? getAddress(helperAddress) : null;
   const tokenIdValue = parseTokenId(tokenId);
@@ -194,6 +317,45 @@ export function App() {
       ? poolInfo.token0
       : poolInfo.token1
     : { address: UP_BNB_V3_POOL.upToken, symbol: "UP", decimals: 18 };
+  const bnbMeta = { address: PANCAKE_V3_ADDRESSES.wbnb, symbol: "BNB", decimals: 18 };
+  const addRange = poolInfo
+    ? addMode === "increase" && position
+      ? { tickLower: position.tickLower, tickUpper: position.tickUpper }
+      : buildRange(poolInfo, depositMode, rangePercent)
+    : null;
+  const addAmounts = useMemo(() => {
+    if (!poolInfo || !addRange) return null;
+    return calculateAddAmounts({
+      poolInfo,
+      range: addRange,
+      depositMode,
+      upAmount,
+      bnbAmount,
+      upDecimals: upMeta.decimals,
+      slippageBps: addSlippageBps
+    });
+  }, [addRange, addSlippageBps, bnbAmount, depositMode, poolInfo, upAmount, upMeta.decimals]);
+  const upAmountDesired = addAmounts
+    ? sameAddress(poolInfo?.token0.address ?? "", UP_BNB_V3_POOL.upToken)
+      ? addAmounts.amount0Desired
+      : addAmounts.amount1Desired
+    : 0n;
+  const needsUpApproval = upAmountDesired > upAllowance;
+  const expectedUpAmount =
+    poolInfo && addAmounts
+      ? sameAddress(poolInfo.token0.address, UP_BNB_V3_POOL.upToken)
+        ? addAmounts.expected.amount0
+        : addAmounts.expected.amount1
+      : 0n;
+  const expectedBnbAmount =
+    poolInfo && addAmounts
+      ? sameAddress(poolInfo.token0.address, PANCAKE_V3_ADDRESSES.wbnb)
+        ? addAmounts.expected.amount0
+        : addAmounts.expected.amount1
+      : 0n;
+  const currentPrice = poolInfo ? currentPriceWbnbPerUp(poolInfo) : null;
+  const minRangePrice = poolInfo && addRange ? priceWbnbPerUpAtTick(addRange.tickLower, poolInfo) : null;
+  const maxRangePrice = poolInfo && addRange ? priceWbnbPerUpAtTick(addRange.tickUpper, poolInfo) : null;
 
   async function ensureBsc() {
     if (!window.ethereum) throw new Error("MetaMask не найден.");
@@ -241,6 +403,8 @@ export function App() {
       setAccount(nextAccount);
       setWalletClient(wc);
       setStatus("Кошелек подключен.");
+      void readPoolInfo().then(setPoolInfo).catch(() => null);
+      void refreshUpAllowance(nextAccount);
       void scanOwnedPositions(nextAccount, false);
     } catch (error) {
       setStatus(`Ошибка подключения: ${compactErrorMessage(error)}`);
@@ -273,8 +437,22 @@ export function App() {
     };
   }
 
+  async function refreshUpAllowance(ownerOverride?: Address) {
+    const owner = ownerOverride ?? account;
+    if (!owner) return;
+    const allowance = await client
+      .readContract({
+        address: UP_BNB_V3_POOL.upToken,
+        abi: erc20Abi,
+        functionName: "allowance",
+        args: [owner, PANCAKE_V3_ADDRESSES.nonfungiblePositionManager]
+      })
+      .catch(() => 0n);
+    setUpAllowance(allowance);
+  }
+
   async function readPoolInfo(): Promise<V3PoolInfo> {
-    const [token0, token1, fee] = await Promise.all([
+    const [token0, token1, fee, tickSpacing, poolLiquidity, slot0] = await Promise.all([
       client.readContract({
         address: UP_BNB_V3_POOL.pool,
         abi: pancakeV3PoolAbi,
@@ -289,6 +467,21 @@ export function App() {
         address: UP_BNB_V3_POOL.pool,
         abi: pancakeV3PoolAbi,
         functionName: "fee"
+      }),
+      client.readContract({
+        address: UP_BNB_V3_POOL.pool,
+        abi: pancakeV3PoolAbi,
+        functionName: "tickSpacing"
+      }),
+      client.readContract({
+        address: UP_BNB_V3_POOL.pool,
+        abi: pancakeV3PoolAbi,
+        functionName: "liquidity"
+      }),
+      client.readContract({
+        address: UP_BNB_V3_POOL.pool,
+        abi: pancakeV3PoolAbi,
+        functionName: "slot0"
       })
     ]);
 
@@ -300,7 +493,11 @@ export function App() {
     return {
       token0: meta0,
       token1: meta1,
-      fee: Number(fee)
+      fee: Number(fee),
+      tickSpacing: Number(tickSpacing),
+      currentTick: Number(slot0[1]),
+      sqrtPriceX96: slot0[0],
+      liquidity: poolLiquidity
     };
   }
 
@@ -428,6 +625,23 @@ export function App() {
       }
     } catch (error) {
       setStatus(`Ошибка поиска позиций: ${compactErrorMessage(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshPoolAndPositions() {
+    try {
+      setBusy(true);
+      setStatus("Обновляю пул и позиции...");
+      const nextPoolInfo = await readPoolInfo();
+      setPoolInfo(nextPoolInfo);
+      if (account) {
+        await Promise.all([scanOwnedPositions(account, false), refreshUpAllowance(account)]);
+      }
+      setStatus("Готово: пул и позиции обновлены.");
+    } catch (error) {
+      setStatus(`Ошибка обновления: ${compactErrorMessage(error)}`);
     } finally {
       setBusy(false);
     }
@@ -567,6 +781,151 @@ export function App() {
     } catch (error) {
       setStatus(`Ошибка approve: ${compactErrorMessage(error)}`);
       return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveUpForLiquidity() {
+    if (!walletClient || !account) {
+      setStatus("Ошибка approve UP: сначала подключите MetaMask.");
+      return;
+    }
+    try {
+      setBusy(true);
+      setStatus("Подтвердите approve UP для PancakeSwap V3 Position Manager...");
+      const hash = await writeWithWallet(walletClient, {
+        address: UP_BNB_V3_POOL.upToken,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [PANCAKE_V3_ADDRESSES.nonfungiblePositionManager, MAX_UINT256],
+        account
+      });
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      assertSuccessfulReceipt(receipt, hash, "Approve UP");
+      await refreshUpAllowance(account);
+      setStatus("Готово: UP разрешен для добавления liquidity.");
+    } catch (error) {
+      setStatus(`Ошибка approve UP: ${compactErrorMessage(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addLiquidity() {
+    if (!walletClient || !account) {
+      setStatus("Ошибка добавления: сначала подключите MetaMask.");
+      return;
+    }
+    const nextPoolInfo = poolInfo ?? (await readPoolInfo());
+    setPoolInfo(nextPoolInfo);
+    const nextRange =
+      addMode === "increase" && position
+        ? { tickLower: position.tickLower, tickUpper: position.tickUpper }
+        : buildRange(nextPoolInfo, depositMode, rangePercent);
+    const nextAddAmounts = calculateAddAmounts({
+      poolInfo: nextPoolInfo,
+      range: nextRange,
+      depositMode,
+      upAmount,
+      bnbAmount,
+      upDecimals: upMeta.decimals,
+      slippageBps: addSlippageBps
+    });
+    if (nextAddAmounts.liquidity <= 0n) {
+      setStatus("Ошибка добавления: для выбранного диапазона и режима получается 0 liquidity.");
+      return;
+    }
+    const requiredUp = sameAddress(nextPoolInfo.token0.address, UP_BNB_V3_POOL.upToken)
+      ? nextAddAmounts.amount0Desired
+      : nextAddAmounts.amount1Desired;
+    if (requiredUp > upAllowance) {
+      setStatus("Ошибка добавления: сначала сделайте Approve UP.");
+      return;
+    }
+    if (addMode === "increase" && (!position || !tokenIdValue || !isOwner)) {
+      setStatus("Ошибка добавления: выберите свою открытую позицию для усиления.");
+      return;
+    }
+
+    const deadline = deadlineFromNow(DEADLINE_SECONDS);
+    const bnbValue = sameAddress(nextPoolInfo.token0.address, PANCAKE_V3_ADDRESSES.wbnb)
+      ? nextAddAmounts.amount0Desired
+      : nextAddAmounts.amount1Desired;
+
+    try {
+      setBusy(true);
+      const callData =
+        addMode === "increase" && tokenIdValue
+          ? encodeFunctionData({
+              abi: pancakeV3PositionManagerAbi,
+              functionName: "increaseLiquidity",
+              args: [
+                {
+                  tokenId: tokenIdValue,
+                  amount0Desired: nextAddAmounts.amount0Desired,
+                  amount1Desired: nextAddAmounts.amount1Desired,
+                  amount0Min: nextAddAmounts.amount0Min,
+                  amount1Min: nextAddAmounts.amount1Min,
+                  deadline
+                }
+              ]
+            })
+          : encodeFunctionData({
+              abi: pancakeV3PositionManagerAbi,
+              functionName: "mint",
+              args: [
+                {
+                  token0: nextPoolInfo.token0.address,
+                  token1: nextPoolInfo.token1.address,
+                  fee: nextPoolInfo.fee,
+                  tickLower: nextRange.tickLower,
+                  tickUpper: nextRange.tickUpper,
+                  amount0Desired: nextAddAmounts.amount0Desired,
+                  amount1Desired: nextAddAmounts.amount1Desired,
+                  amount0Min: nextAddAmounts.amount0Min,
+                  amount1Min: nextAddAmounts.amount1Min,
+                  recipient: account,
+                  deadline
+                }
+              ]
+            });
+      const refundData = encodeFunctionData({
+        abi: pancakeV3PositionManagerAbi,
+        functionName: "refundETH"
+      });
+      const args = [[callData, refundData]] as const;
+
+      setStatus("Проверяю добавление liquidity перед MetaMask...");
+      try {
+        await client.simulateContract({
+          address: PANCAKE_V3_ADDRESSES.nonfungiblePositionManager,
+          abi: pancakeV3PositionManagerAbi,
+          functionName: "multicall",
+          args,
+          account,
+          value: bnbValue
+        });
+      } catch (error) {
+        throw new Error(`Предварительная проверка показала revert: ${compactErrorMessage(error)}`);
+      }
+
+      setStatus(addMode === "increase" ? "Подтвердите усиление позиции..." : "Подтвердите добавление новой позиции...");
+      const hash = await writeWithWallet(walletClient, {
+        address: PANCAKE_V3_ADDRESSES.nonfungiblePositionManager,
+        abi: pancakeV3PositionManagerAbi,
+        functionName: "multicall",
+        args,
+        account,
+        value: bnbValue
+      });
+      setStatus(`Транзакция отправлена: ${hash}. Жду подтверждение...`);
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      assertSuccessfulReceipt(receipt, hash, "Добавление UP/BNB liquidity");
+      await Promise.all([scanOwnedPositions(account, false), refreshUpAllowance(account)]);
+      setStatus(`Готово: liquidity добавлена. Tx: ${hash}`);
+    } catch (error) {
+      setStatus(`Ошибка добавления: ${compactErrorMessage(error)}`);
     } finally {
       setBusy(false);
     }
@@ -893,6 +1252,268 @@ export function App() {
             Снять без продажи
           </button>
         </div>
+      </section>
+
+      <section className="panel liquidity-manager">
+        <div className="pair-strip">
+          <div>
+            <span className="eyebrow">PancakeSwap V3</span>
+            <h2>UP / WBNB</h2>
+            <div className="mini-tags">
+              <span>0.01%</span>
+              <span>V3</span>
+              {poolInfo && <span>Tick {poolInfo.currentTick}</span>}
+            </div>
+          </div>
+          <div className="price-box">
+            <span>Текущая цена</span>
+            <strong>{currentPrice === null ? "-" : formatNumber(currentPrice, 10)}</strong>
+            <small>BNB за UP</small>
+          </div>
+          <button onClick={() => void refreshPoolAndPositions()} disabled={busy}>
+            Обновить
+          </button>
+        </div>
+
+        <div className="manager-grid">
+          <div className="range-card">
+            <div className="panel-title compact-title">
+              <Plus size={18} />
+              <h2>Добавить ликвидность</h2>
+            </div>
+
+            <div className="segmented">
+              <button className={addMode === "new" ? "active" : ""} onClick={() => setAddMode("new")}>
+                Новая позиция
+              </button>
+              <button className={addMode === "increase" ? "active" : ""} onClick={() => setAddMode("increase")}>
+                Усилить выбранную
+              </button>
+            </div>
+
+            <div className="segmented">
+              <button
+                className={depositMode === "bnb" ? "active" : ""}
+                onClick={() => {
+                  setDepositMode("bnb");
+                  setUpAmount("");
+                }}
+              >
+                Только BNB
+              </button>
+              <button
+                className={depositMode === "up" ? "active" : ""}
+                onClick={() => {
+                  setDepositMode("up");
+                  setBnbAmount("");
+                }}
+              >
+                Только UP
+              </button>
+              <button className={depositMode === "both" ? "active" : ""} onClick={() => setDepositMode("both")}>
+                UP + BNB
+              </button>
+            </div>
+
+            <div className="range-visual">
+              <div className="chart-line">
+                <span />
+                <i />
+              </div>
+              <div className="price-cards">
+                <div>
+                  <span>Мин. цена</span>
+                  <strong>{minRangePrice === null ? "-" : formatNumber(minRangePrice, 10)}</strong>
+                  <small>BNB за UP</small>
+                </div>
+                <div>
+                  <span>Макс. цена</span>
+                  <strong>{maxRangePrice === null ? "-" : formatNumber(maxRangePrice, 10)}</strong>
+                  <small>BNB за UP</small>
+                </div>
+              </div>
+              <div className="current-price-card">
+                <span>Текущая цена</span>
+                <strong>{currentPrice === null ? "-" : formatNumber(currentPrice, 10)}</strong>
+                <small>BNB за UP</small>
+              </div>
+            </div>
+
+            <div className="grid three">
+              <label>
+                Диапазон, %
+                <input
+                  value={rangePercent}
+                  onChange={(event) => setRangePercent(event.target.value)}
+                  disabled={addMode === "increase"}
+                />
+              </label>
+              <label>
+                Slippage, bps
+                <input value={addSlippageBps} onChange={(event) => setAddSlippageBps(event.target.value)} />
+              </label>
+              <label>
+                Liquidity
+                <input value={addAmounts?.liquidity.toString() ?? "0"} readOnly />
+              </label>
+            </div>
+          </div>
+
+          <div className="deposit-card">
+            <div className="deposit-total">
+              <span>Сумма депозита</span>
+              <strong>
+                {formatTokenAmount(expectedBnbAmount, 18, 8)} BNB /{" "}
+                {formatTokenAmount(expectedUpAmount, upMeta.decimals, 4)} UP
+              </strong>
+            </div>
+
+            <label className={depositMode === "bnb" ? "" : "token-input"}>
+              BNB
+              <input
+                value={bnbAmount}
+                onChange={(event) => setBnbAmount(event.target.value)}
+                placeholder="0.0"
+                disabled={depositMode === "up"}
+              />
+            </label>
+            <label className={depositMode === "up" ? "" : "token-input"}>
+              UP
+              <input
+                value={upAmount}
+                onChange={(event) => setUpAmount(event.target.value)}
+                placeholder="0.0"
+                disabled={depositMode === "bnb"}
+              />
+            </label>
+
+            <div className="preview">
+              <span>{poolInfo ? "Pool готов" : "Нужен pool"}</span>
+              <span>{addMode === "new" ? "Новая NFT" : position ? `Позиция #${position.tokenId}` : "Выберите позицию"}</span>
+              <span>{needsUpApproval ? "Нужен Approve UP" : "UP approve готов"}</span>
+            </div>
+
+            <button
+              onClick={() => void approveUpForLiquidity()}
+              disabled={!account || upAmountDesired <= 0n || !needsUpApproval || busy}
+            >
+              {needsUpApproval ? "Approve UP" : "UP approve готов"}
+            </button>
+            <button
+              className="primary"
+              onClick={() => void addLiquidity()}
+              disabled={!account || !poolInfo || !addAmounts || addAmounts.liquidity <= 0n || busy}
+            >
+              {addMode === "new" ? "Добавить ликвидность" : "Усилить позицию"}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel positions-panel">
+        <div className="panel-title">
+          <RefreshCcw size={18} />
+          <h2>Открытые позиции</h2>
+        </div>
+
+        {positions.length === 0 ? (
+          <div className="empty-state">Открытые UP/BNB V3 позиции этого кошелька не найдены.</div>
+        ) : (
+          <div className="position-list">
+            {positions.map((item) => {
+              const amounts =
+                poolInfo &&
+                getAmountsForLiquidity(
+                  poolInfo.sqrtPriceX96,
+                  getSqrtRatioAtTick(item.tickLower),
+                  getSqrtRatioAtTick(item.tickUpper),
+                  item.liquidity
+                );
+              const cardUp =
+                poolInfo && amounts
+                  ? sameAddress(item.token0, UP_BNB_V3_POOL.upToken)
+                    ? amounts.amount0
+                    : amounts.amount1
+                  : 0n;
+              const cardBnb =
+                poolInfo && amounts
+                  ? sameAddress(item.token0, PANCAKE_V3_ADDRESSES.wbnb)
+                    ? amounts.amount0
+                    : amounts.amount1
+                  : 0n;
+              const itemUpIsToken0 = sameAddress(item.token0, UP_BNB_V3_POOL.upToken);
+              const cardMin = poolInfo ? priceWbnbPerUpAtTick(item.tickLower, poolInfo) : null;
+              const cardMax = poolInfo ? priceWbnbPerUpAtTick(item.tickUpper, poolInfo) : null;
+              return (
+                <article className="lp-card" key={item.tokenId.toString()}>
+                  <div className="lp-card-head">
+                    <div>
+                      <strong>BNB-UP</strong>
+                      <span>V3 LP #{item.tokenId.toString()} / 0.01%</span>
+                    </div>
+                    <span className="active-badge">Активно</span>
+                  </div>
+                  <div className="lp-stats">
+                    <div>
+                      <span>Ликвидность</span>
+                      <strong>{formatTokenAmount(cardBnb, 18, 8)} BNB</strong>
+                      <strong>{formatTokenAmount(cardUp, upMeta.decimals, 4)} UP</strong>
+                    </div>
+                    <div>
+                      <span>Невостребованные комиссии</span>
+                      <strong>{formatTokenAmount(itemUpIsToken0 ? item.tokensOwed1 : item.tokensOwed0, 18, 8)} BNB</strong>
+                      <strong>
+                        {formatTokenAmount(itemUpIsToken0 ? item.tokensOwed0 : item.tokensOwed1, upMeta.decimals, 4)} UP
+                      </strong>
+                    </div>
+                  </div>
+                  <div className="lp-range">
+                    <div>
+                      <span>Мин. цена</span>
+                      <strong>{cardMin === null ? "-" : formatNumber(cardMin, 10)}</strong>
+                    </div>
+                    <div>
+                      <span>Макс. цена</span>
+                      <strong>{cardMax === null ? "-" : formatNumber(cardMax, 10)}</strong>
+                    </div>
+                  </div>
+                  <div className="lp-actions">
+                    <button
+                      onClick={() => {
+                        setTokenId(item.tokenId.toString());
+                        setPosition(item);
+                        setAddMode("increase");
+                      }}
+                    >
+                      Добавить
+                    </button>
+                    <button
+                      onClick={() => {
+                        setTokenId(item.tokenId.toString());
+                        setPosition(item);
+                        setExitPercent("100");
+                        setStatus(`Позиция #${item.tokenId.toString()} выбрана для изъятия.`);
+                      }}
+                    >
+                      Изъять
+                    </button>
+                    <button
+                      className="primary"
+                      onClick={() => {
+                        setTokenId(item.tokenId.toString());
+                        setPosition(item);
+                        setExitPercent("100");
+                        setStatus(`Позиция #${item.tokenId.toString()} выбрана для изъятия и продажи UP.`);
+                      }}
+                    >
+                      Изъять и продать UP
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <section className="panel compact">

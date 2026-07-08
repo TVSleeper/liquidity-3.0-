@@ -222,6 +222,14 @@ code {
   margin-top: 16px;
 }
 
+.grid.three {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+  margin-top: 16px;
+}
+
 .position {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -253,6 +261,269 @@ code {
   grid-template-columns: 160px minmax(0, 1fr);
 }
 
+.pair-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 16px;
+  align-items: center;
+  padding: 18px;
+  border: 1px solid #493f5f;
+  border-radius: 8px;
+  background: #f7f4ff;
+  color: #2b155d;
+}
+
+.pair-strip h2 {
+  margin: 4px 0;
+  font-size: 2rem;
+  letter-spacing: 0;
+}
+
+.mini-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mini-tags span,
+.active-badge {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0 10px;
+  color: #5f31d4;
+  background: #ebe4ff;
+  font-weight: 900;
+}
+
+.price-box {
+  display: grid;
+  gap: 4px;
+  text-align: right;
+}
+
+.price-box span,
+.price-box small,
+.range-visual span,
+.range-visual small,
+.deposit-total span,
+.lp-card span,
+.lp-range span {
+  color: #7d6aa7;
+  font-weight: 850;
+}
+
+.price-box strong {
+  font-size: 1.5rem;
+}
+
+.manager-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.75fr);
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.range-card,
+.deposit-card,
+.lp-card {
+  border: 1px solid #ded3f7;
+  border-radius: 8px;
+  background: #fbfaff;
+  color: #2b155d;
+}
+
+.range-card,
+.deposit-card {
+  padding: 18px;
+}
+
+.compact-title h2 {
+  color: #2b155d;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 12px 0;
+  padding: 4px;
+  border-radius: 8px;
+  background: #eee8fb;
+}
+
+.segmented:first-of-type {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.segmented button {
+  min-height: 40px;
+  color: #6747b7;
+  background: transparent;
+}
+
+.segmented button.active {
+  color: #171725;
+  background: #24c7d4;
+}
+
+.range-visual {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid #e2d8f8;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.chart-line {
+  position: relative;
+  height: 150px;
+  margin-bottom: 14px;
+  border-radius: 8px;
+  background:
+    linear-gradient(#f0edf8 1px, transparent 1px),
+    linear-gradient(90deg, #f0edf8 1px, transparent 1px),
+    #fff;
+  background-size: 100% 48px, 92px 100%;
+  overflow: hidden;
+}
+
+.chart-line span {
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  top: 52%;
+  height: 3px;
+  border-radius: 999px;
+  background: #7a4cff;
+}
+
+.chart-line i {
+  position: absolute;
+  right: 12%;
+  top: 20%;
+  bottom: 14%;
+  width: 18%;
+  border-radius: 6px;
+  background: rgba(122, 76, 255, 0.12);
+}
+
+.price-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.price-cards div,
+.current-price-card,
+.deposit-total {
+  display: grid;
+  gap: 4px;
+  padding: 16px;
+  border: 1px solid #d9ccf7;
+  border-radius: 8px;
+  background: #f2ecff;
+}
+
+.current-price-card {
+  margin-top: 12px;
+  text-align: center;
+}
+
+.deposit-card {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.deposit-card label {
+  padding: 14px;
+  border: 1px solid #e0d5f7;
+  border-radius: 8px;
+  background: #fff;
+  color: #2b155d;
+}
+
+.deposit-card input,
+.range-card input {
+  color: #2b155d;
+  border-color: #d8cdf3;
+  background: #f1ebff;
+}
+
+.deposit-total strong {
+  font-size: 1.2rem;
+}
+
+.positions-panel {
+  background: #f7f4ff;
+  color: #2b155d;
+}
+
+.positions-panel .panel-title h2 {
+  color: #2b155d;
+}
+
+.empty-state {
+  padding: 22px;
+  border: 1px dashed #cbbcf0;
+  border-radius: 8px;
+  color: #7d6aa7;
+  background: #fff;
+  font-weight: 850;
+}
+
+.position-list {
+  display: grid;
+  gap: 14px;
+}
+
+.lp-card {
+  padding: 18px;
+}
+
+.lp-card-head,
+.lp-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lp-card-head div {
+  display: grid;
+  gap: 4px;
+}
+
+.lp-card-head strong {
+  font-size: 1.25rem;
+}
+
+.lp-stats,
+.lp-range {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.lp-stats div,
+.lp-range div {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid #e0d5f7;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.lp-actions {
+  justify-content: flex-end;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
 .spin {
   animation: spin 1s linear infinite;
 }
@@ -272,8 +543,14 @@ code {
   .topbar,
   .row,
   .grid.four,
+  .grid.three,
   .position,
-  .addresses {
+  .addresses,
+  .pair-strip,
+  .manager-grid,
+  .price-cards,
+  .lp-stats,
+  .lp-range {
     grid-template-columns: 1fr;
   }
 
